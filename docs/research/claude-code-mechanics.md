@@ -67,19 +67,35 @@ Every hook payload includes stable identifiers:
 - `session_id` — primary key; stable across resume/fork.
 - `cwd` — derive the project/repo label.
 - `transcript_path` — the JSONL to tail for context.
-- **tmux pane** — *not* in the payload. The `SessionStart` hook must capture `$TMUX_PANE` from
-  its environment and POST it alongside `session_id`, so the registry can build
-  `session_id → pane` for delivery. Without this mapping, Substrate A cannot route a reply.
+- **tmux pane** — *not* in the payload, but **available in the hook's environment as
+  `$TMUX_PANE`** (confirmed by probe 2026-05-25, in both interactive and `-p` modes). Capture it
+  on **every** emit and POST it alongside `session_id`, so the `session_id → pane` registry
+  self-heals across resume / pane reuse / window moves. Pane ids (`%446`) are tmux-server-global
+  and addressable by any `tmux` command from outside tmux.
+
+**Confirmed environment available to hook commands (probe 2026-05-25):** `TMUX_PANE`, `TMUX`,
+`CLAUDE_CODE_SESSION_ID`, `CLAUDE_PROJECT_DIR`, `CLAUDE_CODE_ENTRYPOINT` (`cli` interactive vs
+`sdk-cli` for `-p`), `CLAUDECODE=1`, `TERM_PROGRAM=tmux`, `CLAUDE_ENV_FILE` (per-session state
+dir). So identity is available both as env vars and in the payload.
 
 ---
 
 ## 3. CONTEXT — reconstruct what the session is asking
 
-### Transcript JSONL (primary)
+### From the `Stop` payload directly (primary, no transcript needed)
+
+**Confirmed (probe 2026-05-25):** the `Stop` payload includes `last_assistant_message` — what
+the agent just said — so the queue can render context straight from the hook. It also carries
+`permission_mode`, `effort`, `stop_hook_active`, `background_tasks`, `session_crons`. This makes
+transcript tailing an enhancement, not a requirement, for the stopped case.
+
+### Transcript JSONL (deeper context)
 
 `transcript_path` is an append-only JSONL — one object per line, tailable in real time. The
-last assistant / tool-use entry holds the permission request, the plan text, or the question
-body. The collector tails from the last seen offset and extracts the trailing decision context.
+last assistant / tool-use entry holds the permission request or the question body in full. The
+collector tails from the last seen offset and extracts the trailing decision context. It is
+also the **ground truth** for the reconcile loop (see the plan): if the transcript has advanced
+past the last `Stop`, the session progressed → dequeue.
 
 ### tmux capture-pane (fallback / literal view)
 

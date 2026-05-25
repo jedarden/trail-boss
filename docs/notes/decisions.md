@@ -31,32 +31,55 @@ newcomers.
 ### Hooks, not polling
 
 Detection is event-driven via Claude Code hooks. A session emits a signal the moment control
-returns to a human, so there is a clean boundary with no false positives: while a session is
-actively working it emits `PreToolUse`/`PostToolUse`, never `Stop`. A session only counts as
-waiting once `Stop` or `PermissionRequest` has fired and no `UserPromptSubmit` has come since.
+returns to a human: while actively working it emits `PreToolUse`/`PostToolUse`, never `Stop`.
+A session counts as waiting only once `Stop` or `PermissionRequest` has fired and no
+`UserPromptSubmit` has come since. **Confirmed by probe (2026-05-25):** both `SessionStart` and
+`Stop` fire in interactive and `-p` modes, the `Stop` payload carries `last_assistant_message`
+(queue context for free), and hook commands inherit the ambient environment.
 
-### `Stop` + `PermissionRequest` are the load-bearing signals
+### Stopped = needs attention
 
-`Stop` reliably means "turn finished, idle, waiting for the next prompt" — so the "wants the
-next instruction" case needs no transcript polling. `PermissionRequest` covers hard approval
-blocks. `Notification` is kept optional pending a probe of whether it adds anything those two
-miss.
+A stopped session cannot progress toward its goal, so it needs intervention by definition.
+There is no "finished but fine" state to distinguish — **every `Stop` is a queue item.** This
+collapses the fuzzy idle-vs-done question and makes `Stop` + `PermissionRequest` sufficient;
+`Notification` stays optional pending a probe of whether it adds anything they miss.
 
-### Substrate A (tmux) first, Substrate B (SDK) later
+### Navigator, not relay (the delivery model)
 
-Two ways to deliver a reply back into a session:
+Trail Boss routes *attention*, it does not inject *input*. Sessions stay as long-running live
+CLIs in tmux panes (Model A), and delivery happens by navigating the operator to the live pane
+(`switch-client`/`select-window`/`select-pane`, optionally `link-window` to co-display) where
+they interact with the real prompt directly. This dissolves the send-keys fidelity problem,
+makes "edit before allow" native (you just type), and means no synthesized input ever reaches a
+session.
 
-- **A — tmux `send-keys`**: overlays an existing terminal workflow with zero rewrite. A
-  `SessionStart` hook captures `$TMUX_PANE` to map `session_id → pane`. Chosen for the MVP.
-- **B — Agent SDK `canUseTool` + streaming input**: programmatic, can pend on a permission
-  decision indefinitely and return modified input, but requires running sessions under the SDK
-  instead of the terminal. Deferred to v2.
+Rejected delivery alternatives:
 
-Headless `claude -p` is explicitly *not* a delivery path — it is one-shot and cannot stream
-input into a running session.
+- **Resume-to-deliver** (`claude --resume <id>` in a second process): a live interactive CLI
+  holds in-memory state and does not re-read its transcript, so a resumed process's reply never
+  reaches the original pane; concurrent attach risks transcript divergence. `--fork-session`
+  confirms plain `--resume` reuses the session. Only viable in a no-resident-process model
+  (Model B), which we rejected for v1.
+- **`send-keys` relay as the primary path:** retained only as a secondary plain-text option
+  (basic submission confirmed working); native interaction is preferred.
+- **`claude --remote-control`:** routes to the claude.ai / desktop / mobile surface, not a local
+  channel — useless for a same-host tool.
+- **Agent SDK `canUseTool` (Model B):** programmatic permission gating with `updatedInput` is
+  attractive, but requires running sessions under the SDK instead of the terminal — deferred;
+  the tmux-navigator model fits the existing workflow and the durability requirement.
 
-### Only deliver human-authored input
+### Same-host daemon, durable via tmux
 
-The dispatcher must `send-keys` only content the human explicitly typed in the pane — it never
-synthesizes or auto-answers a session. Trail Boss routes attention; it does not act on the
-human's behalf.
+Trail Boss does not need to live *inside* tmux to drive it — tmux is client/server, so any
+same-user process issues `tmux` commands to the server (pane ids are server-global). The
+control plane is an always-on daemon; presentation is transient (`display-popup` + keybinding).
+But for durability across SSH disconnect the daemon must survive SIGHUP, so it runs **in its own
+tmux window** (simplest) or under **`systemd --user`** (also survives reboot; tmux does not).
+Agents already persist because the tmux server is host-side. While disconnected, the daemon and
+hooks keep running, so the queue accumulates the backlog and disconnecting becomes a non-event.
+
+### The transcript is ground truth
+
+Hooks are a low-latency notification; the transcript JSONL is authoritative. A reconcile loop
+corrects dropped hook POSTs, daemon restarts, and "answered directly in the pane" by checking
+whether a session's transcript has advanced past its last `Stop`.
