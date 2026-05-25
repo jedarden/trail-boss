@@ -99,8 +99,11 @@ interaction sidesteps this entirely.
 
 1. **A blocked-state signal from every session** — Claude Code hooks (`Stop`,
    `PermissionRequest`), POSTing their stdin JSON to a local collector.
-2. **A central collector + live state store** — tracks every session's status, holds the
-   `session_id → pane` registry, broadcasts the queue.
+2. **A central collector + live state store** — tracks every session's status and holds the
+   `session_id → pane` registry. The collector **is the daemon** (see Architecture); its HTTP
+   ingest endpoint is one face of that single process. Presentation reads current state on
+   demand (the `display-popup` *pulls*; there is no push/broadcast channel), so no WebSocket is
+   required. An optional status-line "N stuck" segment, if added, polls the daemon.
 3. **Context extraction** — *what* each session is asking. Largely free from the hook payload
    (see below); transcript tail for deeper/permission context.
 4. **The Trail Boss queue** — a FIFO depletion surface (oldest-stuck first), keyboard-driven.
@@ -119,7 +122,8 @@ stuck conditions: a session waiting at a permission prompt is mid-turn and does 
 | `Stop` | Turn finished; session waiting for the next instruction. | Confirmed firing in interactive and `-p` (probe 2026-05-25); payload carries `last_assistant_message` |
 | `PermissionRequest` | Session blocked mid-turn on approval — emits **no** `Stop`, so this is the only signal for the permission case. | Exists; firing/payload **not yet probed** (phase 1) |
 | `UserPromptSubmit` | Input submitted → session unstuck → **dequeue**. | Confirmed primitive |
-| `SessionStart` / `SessionEnd` | Register / retire the session (and re-assert `session_id → pane`). | Confirmed firing (probe) |
+| `SessionStart` | Register the session; re-assert `session_id → pane`. | Confirmed firing (probe) |
+| `SessionEnd` | Retire the session. | Exists; firing not yet probed |
 | ~~`Notification`~~ | Dropped — `Stop` + `PermissionRequest` cover every stuck case; the dead-letter queue just fills and drains. | Not used |
 
 Both `Stop` and `PermissionRequest` enqueue a plain stuck item with no priority difference.
@@ -165,8 +169,8 @@ the host provides every needed primitive (all confirmed present):
 `switch-client`, `select-window`, `select-pane`, `link-window`/`unlink-window`,
 `join-pane`/`break-pane`, `pipe-pane`, `capture-pane`, `display-popup`.
 
-- **Minimal (recommended start):** route the operator's client to the most-stuck pane —
-  `switch-client` + `select-window`/`select-pane %id`. This *is* "eliminate manual
+- **Minimal (recommended start):** route the operator's client to the head-of-queue
+  (oldest-stuck) pane — `switch-client` + `select-window`/`select-pane %id`. This *is* "eliminate manual
   tab-switching," with zero relay.
 - **Embedded (optional polish):** `link-window` the target session's window into a Trail Boss
   view so the queue and live pane are co-visible, then `unlink-window`. Non-destructive (tmux
@@ -219,7 +223,7 @@ the live pane. No special edit affordance or `canUseTool` round-trip is required
            display-popup (queue overlay)  ──select──▶  switch-client /
            + optional status-line "N stuck"            select-window/pane
                                                         → you land on the
-                                                          live most-stuck pane
+                                                          live head-of-queue pane
 ```
 
 ### Daemon vs. presentation split
@@ -288,12 +292,18 @@ loads.
 - **Membership:** every stuck session (from `Stop` or `PermissionRequest`). No priority between
   reasons; `reason` is display-only. Reconcile removes any that have progressed.
 - **Order:** oldest-stuck first (FIFO). The head of the queue is "the current session."
-- **Auto-advance:** the operator's focus is navigated to the current session. When that session
-  resolves — `UserPromptSubmit` fires (you responded) or you `skip` — Trail Boss **loads the
-  next** stuck session into focus. The operator drains the queue one session at a time without
-  ever choosing "which next."
-- **Skip:** advances to the next without acting; the skipped session stays in the queue and
-  re-surfaces later in the cycle.
+- **Auto-advance (no forced focus-steal):** the operator works the *current* session in its
+  live pane. When that session resolves — `UserPromptSubmit` fires (you responded) or you
+  `skip` — the daemon **computes** the next head of queue, but the actual jump is
+  **operator-initiated** (a keypress / re-invoking the popup), never an automatic
+  `switch-client`. This matters because responding *is* what fires `UserPromptSubmit`: a forced
+  jump would teleport you out of the pane the instant you hit Enter. So depletion is "resolve →
+  next is ready → you press to advance," not a focus-steal. (Whether to offer an opt-in
+  "auto-jump on resolve" toggle is deferred.)
+- **Skip:** advances to the next without acting. The skipped session is **moved to the tail** of
+  the FIFO (and stamped with a short re-surface cooldown) so depletion always progresses and a
+  single item can't be re-selected immediately. In a one-item queue, skip lands you on empty;
+  the item re-surfaces on its next event or after the cooldown.
 - **Dequeue:** transcript advances past the last stuck point, or `UserPromptSubmit` fires, or
   `SessionEnd`.
 - **Empty queue:** nothing stuck → no auto-advance; the operator is free. New stuck sessions
@@ -335,8 +345,8 @@ Still **unverified** (probe before depending on): `PermissionRequest` firing + p
 3. **Daemon (control plane)** — ingest endpoint behind the normalized stuck/unstuck adapter
    contract, SQLite state, self-healing registry, the transcript reconcile loop, FIFO queue.
    Runs in its own tmux window.
-4. **Navigation** — `switch-client`/`select-window`/`select-pane` to route to a pane by id, and
-   auto-advance to the next stuck session on resolve/skip.
+4. **Navigation** — `switch-client`/`select-window`/`select-pane` to route to a pane by id;
+   compute the next head on resolve/skip and jump on operator action (no forced focus-steal).
 5. **Presentation** — `display-popup` queue overlay + keybinding; optional status-line segment.
 6. **Close the loop (walking skeleton)** — stuck pane → loaded into focus → interact → reconcile
    dequeues it → next stuck session auto-loads. This end-to-end depletion path is the first
@@ -352,6 +362,20 @@ Still **unverified** (probe before depending on): `PermissionRequest` firing + p
 - *Human-authored only:* the daemon never sends synthesized input to a session.
 - *The queue never lies:* a displayed item reflects current transcript state (reconcile is
   authoritative over hook events).
+
+**Trust boundary**
+- The collector/daemon binds its ingest endpoint to **loopback only** (`127.0.0.1:4000`) — it is
+  never exposed off-host. Per the single-operator/single-host non-goal, **all local processes are
+  trusted**: hook POSTs are unauthenticated and the `session_id` / `$TMUX_PANE` they carry are
+  taken on trust.
+- This is acceptable on a single-user host. On a **multi-user host** it is not: any local process
+  could POST a forged event with an attacker-chosen `$TMUX_PANE`, causing the daemon to navigate
+  the operator to — or, if the optional `send-keys` path is enabled, type into — an arbitrary
+  pane. Mitigations if that ever matters: a unix-domain socket with file-mode restrictions, or a
+  shared secret in the hook POSTs.
+- The optional `send-keys` delivery path is the only way a forged event could inject
+  *keystrokes*; with it disabled (navigation-only, the default), a forged event can at worst
+  mis-route the operator's focus — annoying, not destructive.
 
 **Failure modes**
 - *Hook POST dropped (collector down/slow):* hook exits 0, event lost → reconcile sweep
@@ -376,9 +400,11 @@ Still **unverified** (probe before depending on): `PermissionRequest` firing + p
    harnesses? See "Layering" above.
 2. **`PermissionRequest` specifics** — confirm it fires for the gate types you hit and what its
    payload carries (the proposed command, for display). Detection coverage depends on it; phase 1.
-3. **Auto-advance trigger** — exactly what counts as "done with the current session" →
-   load next: `UserPromptSubmit` and explicit `skip` are clear; should manually navigating away
-   also advance? And is the jump immediate or on a keypress?
+3. **Auto-advance residuals** — the trigger and jump model are decided (resolve via
+   `UserPromptSubmit`/`skip` → next is computed → operator-initiated jump, never a forced
+   focus-steal; see "Queue & interaction loop"). Residual: should manually navigating away from
+   the current pane also count as advancing, and is an opt-in "auto-jump on resolve" toggle
+   worth offering? Decide after the walking skeleton.
 4. **Presentation UX** — `display-popup` queue + jump vs. a dedicated always-visible window;
    decide after the walking skeleton.
 

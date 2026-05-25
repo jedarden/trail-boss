@@ -19,7 +19,6 @@ the collector is enough:
       { "hooks": [ { "type": "command",
                      "command": "curl -s -X POST http://localhost:4000/event --data-binary @-" } ] }
     ],
-    "Notification":      [ { "hooks": [ { "type": "command", "command": "~/.claude/trailboss-emit.sh" } ] } ],
     "Stop":              [ { "hooks": [ { "type": "command", "command": "~/.claude/trailboss-emit.sh" } ] } ],
     "UserPromptSubmit":  [ { "hooks": [ { "type": "command", "command": "~/.claude/trailboss-emit.sh" } ] } ],
     "SessionStart":      [ { "hooks": [ { "type": "command", "command": "~/.claude/trailboss-register.sh" } ] } ],
@@ -32,21 +31,20 @@ Events relevant to "needs a human":
 
 | Event | Meaning for the queue | Confidence |
 |-------|----------------------|------------|
-| `Stop` | **Turn finished; session idle, waiting for the next prompt.** The reliable idle signal — fires every time a turn completes. Enqueue "ready for next." | Confirmed |
-| `PermissionRequest` | Hard block: a tool wants approval. Enqueue allow/deny. | Confirmed exists |
-| `Notification` | Claude notifying the user (permission prompt, long-idle nudge). Supplementary; **trigger conditions less documented.** | **(verify, optional)** |
+| `Stop` | **Turn finished; session waiting for the next instruction.** Enqueue a stuck item. | Confirmed firing (probe) |
+| `PermissionRequest` | Session blocked mid-turn on approval. Emits **no** `Stop`, so it is the only signal for the permission case. Enqueue a stuck item. | Exists; firing/payload not yet probed |
 | `SubagentStop` | A subagent finished — usually *not* a human-input point; ignore. | Confirmed |
 | `UserPromptSubmit` | Human submitted input → block resolved → **dequeue**. | Confirmed |
-| `SessionStart` / `SessionEnd` | Register / retire the session. | Confirmed |
+| `SessionStart` | Register the session; capture `$TMUX_PANE`. | Confirmed firing (probe) |
+| `SessionEnd` | Retire the session. | Exists; firing not yet probed |
 | `PreToolUse` / `PostToolUse` | Activity telemetry (the "running" state), not blocks. | Confirmed |
 
-> **Detection model (settled):** the two load-bearing signals are `Stop` (idle, waiting for the
-> next prompt) and `PermissionRequest` (a hard block). `Stop` makes the "wants the next
-> instruction" case free — no polling. `Notification` is supplementary; the only open question
-> is whether it surfaces anything those two miss (e.g., a long-idle nudge), and if not it can
-> be dropped. Optional probe: log `Notification` alongside `Stop`/`PermissionRequest` across
-> (a) a permission prompt, (b) plan-mode approval, (c) a clarifying question, (d) a finished
-> turn at an empty prompt, and see if it ever adds signal.
+> **Detection model (settled):** the two enqueue triggers are `Stop` (turn finished, waiting)
+> and `PermissionRequest` (blocked mid-turn). **Both are required** — a permission-blocked
+> session is mid-turn and emits no `Stop`, so without `PermissionRequest` it would never be
+> detected. They are treated identically (a flat stuck item; `reason` is display-only, never a
+> priority). `Notification` was evaluated and **dropped** — `Stop` + `PermissionRequest` cover
+> every stuck case. See `../plan/plan.md` ("Detection model" and the resolved-questions list).
 
 ---
 
@@ -108,44 +106,41 @@ prompt. Cheap; poll on demand.
 
 ---
 
-## 4. DELIVER — get the reply back into the exact session
+## 4. DELIVER — route the operator to the live session (navigation, not relay)
 
-### Substrate A — tmux `send-keys` (overlays a terminal workflow)
+Trail Boss does **not** inject answers. It navigates the operator to the live pane, where they
+interact with the real prompt directly (see `../plan/plan.md`, "Navigator, not relay" and the
+delivery decision in `../notes/decisions.md`). The relevant primitives, all tmux-server-global
+so they work from outside tmux:
 
 ```bash
-# free-text reply (a clarifying answer or the next instruction)
-tmux send-keys -t <pane> -l 'shard by tenant; tenants are the hard isolation boundary'
-tmux send-keys -t <pane> Enter
-
-# permission menu choice (send the option key the prompt expects)
-tmux send-keys -t <pane> '1'           # or 'y' / arrow+Enter, depending on the prompt
+# bring the operator's client to the stuck pane (pane ids like %446 are global)
+tmux switch-client -t "$(tmux display -p -t %446 '#{session_name}')"
+tmux select-window -t %446
+tmux select-pane   -t %446
+# optional co-display: link the target window into a Trail Boss view, then unlink
+tmux link-window -s <src-session>:<window> -t trailboss: ; tmux unlink-window -t trailboss:<n>
 ```
 
-- `-l` sends the argument literally; send `Enter` separately.
-- Requires the `session_id → pane` mapping from the `SessionStart` hook.
-- **Verify** multi-line/paste fidelity and how each prompt type consumes keystrokes.
-- Works regardless of how the session was launched — it stays a normal interactive session.
+- Primary delivery is **navigation** — the operator types into the genuine CLI, so there is no
+  keystroke-fidelity problem and "edit before allow" is native.
+- **Secondary (optional):** `tmux send-keys -t %446 -l '<text>'` then `send-keys -t %446 Enter`
+  for plain-text submission (basic submission confirmed in the probe). Not the primary path; the
+  daemon never sends *synthesized* input — only human-authored text, and only if this path is
+  enabled.
 
-### Substrate B — Agent SDK (the clean rewrite)
+### Rejected delivery alternatives
 
-If sessions run under the Python/TypeScript Agent SDK:
-
-- **`canUseTool` callback** (`can_use_tool` in Python) — fires for any tool needing approval and
-  for clarifying questions. It can **await indefinitely** while the orchestrator collects your
-  remote decision, then returns `{ behavior: "allow" | "deny", updatedInput?, message? }` —
-  including a *modified* tool input. The cleanest "answer from elsewhere" hook: execution pauses
-  until you respond.
-- **Streaming input** — the SDK accepts an async-iterable prompt stream, so follow-up turns are
-  delivered programmatically over a long-lived channel.
-- **Resume** — `resume: <session_id>` to continue a specific session.
-
-### Why headless `claude -p` is NOT a delivery path
-
-`claude -p` (print/headless) with `--output-format stream-json` / `--input-format stream-json`
-is **one-shot**: it cannot stream additional user messages into an already-running session, and
-interactive permission prompting is unavailable (you must pre-authorize with `--allowedTools`
-or wire `--permission-prompt-tool <mcp_tool>`, whose payload schema is undocumented —
-**(verify)**). Use the SDK, not `-p`, for Substrate B.
+- **Resume-to-deliver** (`claude --resume <id>` in a second process) does **not** reach the
+  original live pane — a live interactive CLI holds in-memory state and does not re-read its
+  transcript; concurrent attach risks divergence. `--fork-session` confirms `--resume` reuses
+  the session. Only viable in a no-resident-process model, which is rejected for v1.
+- **Agent SDK `canUseTool` + streaming input** would allow programmatic permission gating with
+  `updatedInput`, but requires running sessions under the SDK instead of the terminal —
+  deferred; the tmux-navigator model fits the existing workflow.
+- **`claude --remote-control`** routes to the claude.ai / desktop / mobile surface, not a local
+  channel — useless for a same-host tool.
+- **Headless `claude -p`** is one-shot and cannot stream input into a running session.
 
 ---
 
@@ -153,13 +148,12 @@ or wire `--permission-prompt-tool <mcp_tool>`, whose payload schema is undocumen
 
 | Need | Primitive | Identifier / flag | Confidence |
 |------|-----------|-------------------|------------|
-| Detect idle / waiting for next prompt | `Stop` hook | stdin JSON | confirmed (primary idle signal) |
-| Detect permission block | `PermissionRequest` hook | stdin JSON | confirmed |
-| Detect long-idle nudge (optional) | `Notification` hook | stdin JSON | **(verify, optional)** |
+| Detect waiting for next instruction | `Stop` hook | stdin JSON | confirmed firing (probe) |
+| Detect permission block | `PermissionRequest` hook | stdin JSON | exists; not yet probed |
 | Detect resolved block | `UserPromptSubmit` hook | `session_id` | confirmed |
-| Correlate to session/repo | any hook payload | `session_id`, `cwd`, `transcript_path` | confirmed |
-| Correlate to tmux pane | `SessionStart` hook | `$TMUX_PANE` (capture in script) | confirmed (you wire it) |
-| Read the question | transcript JSONL / `capture-pane` | `transcript_path` / pane | confirmed |
-| Deliver reply (overlay) | tmux `send-keys -t <pane>` | pane id | confirmed |
-| Deliver reply (rewrite) | Agent SDK `canUseTool` + streaming input | `session_id` | confirmed (SDK only) |
-| Deliver reply (headless) | — | not viable (`-p` is one-shot) | confirmed limitation |
+| Correlate to session/repo | any hook payload + env | `session_id`, `cwd`, `transcript_path`, `CLAUDE_CODE_SESSION_ID` | confirmed (probe) |
+| Correlate to tmux pane | any emit hook | `$TMUX_PANE` (in hook env) | confirmed (probe) |
+| Read the question | `Stop` payload `last_assistant_message` / transcript / `capture-pane` | payload / `transcript_path` / pane | confirmed (probe) |
+| Deliver (primary) | tmux navigation (`switch-client`/`select-window`/`select-pane`) | pane id | confirmed primitives |
+| Deliver (secondary, optional) | tmux `send-keys -t <pane>` (human-authored text only) | pane id | basic submission confirmed |
+| Rejected: resume / SDK / remote-control / `-p` | — | — | see "Rejected" above |

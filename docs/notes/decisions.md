@@ -11,7 +11,8 @@ it right. The metaphor maps cleanly onto the mechanism:
 - **a steer bogs down or strays** → a `Stop` / `PermissionRequest` hook fires; the collector
   flags the session stuck
 - **the trail boss rides over and sets it right** → you read the context and give the order
-  (reply) or wave it on (skip); ranking surfaces the most-stuck first
+  (reply) or wave it on (skip); the queue surfaces stuck sessions oldest-first (flat FIFO, no
+  priority ranking)
 
 ### Names considered and rejected
 
