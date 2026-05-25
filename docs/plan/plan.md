@@ -319,6 +319,44 @@ keeps depleting it, and the next-in-line always loads. There is no ceiling logic
 
 ---
 
+## Switching & keybindings
+
+The operator drives the whole loop with a few **global tmux keybindings that call the daemon**.
+A binding runs a `run-shell` command, which executes on the tmux server, so it can both query
+the daemon's loopback endpoint *and* issue the navigation in one step. Three actions:
+
+| Key (example) | Action | What it does |
+|---------------|--------|--------------|
+| `prefix + Tab` | **Next** | `trailboss jump-next` → `GET localhost:4000/next` returns the head-of-queue pane id → `tmux switch-client … \; select-window -t %ID \; select-pane -t %ID`. Lands you on the oldest-ready-stuck session. The primary action: *deal with current → press Next → land on the next stuck pane.* |
+| `prefix + g` | **Popup / pick** | `display-popup -E 'trailboss popup'` renders the FIFO list (each item's reason + `last_assistant_message` snippet); arrow/number to choose; the popup exits and jumps you there. For triage or non-sequential jumps. |
+| `prefix + s` | **Skip** | `trailboss skip` → daemon moves the current head to the tail + cooldown, then jumps to the new head (skip-and-advance in one press). |
+
+Plus an ambient **status-line segment** (e.g. `⚠ 3 stuck`) so the operator knows when there's
+anything to press Next for. The jump itself relies on pane ids being tmux-server-global:
+
+```bash
+# trailboss jump-next (essentials)
+id=$(curl -s localhost:4000/next)        # daemon returns head-of-queue pane id, e.g. %446
+[ -n "$id" ] && tmux switch-client -t "$(tmux display -p -t "$id" '#{session_name}')" \
+                 \; select-window -t "$id" \; select-pane -t "$id"
+```
+
+Two constraints:
+
+- **Use prefix bindings, not bare `Alt-`/`Ctrl-` keys.** A no-prefix binding would be globally
+  stolen by tmux from the Claude Code TUI you're typing into, and could collide with the CLI's
+  own keys. Prefix-based costs one extra keystroke but never interferes with session input.
+- **The jump is the keypress — never automatic.** Replying *is* what fires `UserPromptSubmit`
+  and dequeues the current session; an automatic jump would teleport you out of the pane the
+  instant you hit Enter. Manual tmux navigation (`prefix + <n>`) is orthogonal — wandering off a
+  pane the normal way does not change queue state; only a reply (`UserPromptSubmit`) or `skip`
+  does.
+
+This is the entire switching surface: one key cycles you through stuck sessions oldest-first, a
+second shows the list to pick from, a third skips.
+
+---
+
 ## Confirmed mechanics (empirical, 2026-05-25)
 
 Probe: a `--settings`-loaded hook dumping env + stdin payload, run both via `claude -p` and a
@@ -405,13 +443,14 @@ Still **unverified** (probe before depending on): `PermissionRequest` firing + p
    harnesses? See "Layering" above.
 2. **`PermissionRequest` specifics** — confirm it fires for the gate types you hit and what its
    payload carries (the proposed command, for display). Detection coverage depends on it; phase 1.
-3. **Auto-advance residuals** — the trigger and jump model are decided (resolve via
-   `UserPromptSubmit`/`skip` → next is computed → operator-initiated jump, never a forced
-   focus-steal; see "Queue & interaction loop"). Residual: should manually navigating away from
-   the current pane also count as advancing, and is an opt-in "auto-jump on resolve" toggle
-   worth offering? Decide after the walking skeleton.
-4. **Presentation UX** — `display-popup` queue + jump vs. a dedicated always-visible window;
+3. **Auto-advance residual** — the trigger, jump model, and keybindings are specified (see
+   "Switching & keybindings": Next/Popup/Skip keys, operator-initiated jump, manual tmux nav is
+   orthogonal). The only residual is whether to offer an opt-in "auto-jump on resolve" toggle —
    decide after the walking skeleton.
+4. **Presentation polish** — the mechanism is specified (`display-popup` picker + Next/Skip
+   keybindings + status-line segment). Residual polish: exact key choices, popup layout/columns,
+   and whether a dedicated always-visible window is worth adding alongside the popup. Tune after
+   the walking skeleton.
 
 **Resolved this round (recorded so they don't get re-litigated)**
 
