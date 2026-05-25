@@ -37,12 +37,16 @@ A session counts as waiting only once `Stop` or `PermissionRequest` has fired an
 `Stop` fire in interactive and `-p` modes, the `Stop` payload carries `last_assistant_message`
 (queue context for free), and hook commands inherit the ambient environment.
 
-### Stopped = needs attention
+### Stuck = needs attention, and stuck is stuck
 
-A stopped session cannot progress toward its goal, so it needs intervention by definition.
-There is no "finished but fine" state to distinguish — **every `Stop` is a queue item.** This
-collapses the fuzzy idle-vs-done question and makes `Stop` + `PermissionRequest` sufficient;
-`Notification` stays optional pending a probe of whether it adds anything they miss.
+A session that has stopped or is waiting at a permission prompt cannot progress until the human
+responds — so it needs intervention by definition. Two collapses follow: there is no
+"finished but fine" state (every stop is a queue item), and there is no permission-vs-stopped
+priority (it doesn't matter *why* it's stuck). `Stop` and `PermissionRequest` are both required
+detection triggers — a permission-blocked session is mid-turn and emits no `Stop` — but they're
+treated identically; `reason` is display-only and the queue is a flat FIFO dead-letter queue.
+`Notification` is dropped (it adds nothing those two miss). The operator simply depletes the
+queue, and the next stuck session auto-loads.
 
 ### Navigator, not relay (the delivery model)
 

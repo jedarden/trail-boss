@@ -31,13 +31,22 @@ agent can't proceed on its own, it falls through to you.
 the happy path never touches you; only stalled work routes to you, you process the exception
 (reply or skip), and it goes back on the wire.
 
-### The "stopped = needs attention" axiom
+### The "stuck = needs attention" axiom — and stuck is stuck
 
-A session that has stopped cannot progress toward its goal — therefore it needs intervention,
-by definition. This collapses the fuzzy "idle vs. done" question: **every `Stop` is a real
-queue item.** There is no separate "finished but fine" state to detect; if it stopped and you
-haven't responded, it's waiting on you. (The deeper fix — making the interactive CLIs
-longer-running so they stop less often — is a separate workstream, not Trail Boss's concern.)
+A session that has stopped *or* is waiting at a permission prompt cannot progress toward its
+goal until the human responds — therefore it needs intervention, by definition. This collapses
+two fuzzy questions at once:
+
+- **No "idle vs. done" distinction.** There is no separate "finished but fine" state; if it
+  stopped and you haven't responded, it's waiting on you. Every stop is a queue item.
+- **No "permission vs. stopped" distinction.** It doesn't matter *why* a session is stuck —
+  both mean "blocked until the human acts." The two are detected by different hooks (see below)
+  but are **treated identically** in the queue. `reason` is display-only metadata, never a
+  priority input.
+
+So the queue is a flat **dead-letter queue**: stuck sessions accumulate and the operator
+depletes them. (The deeper fix — making the interactive CLIs longer-running so they stop less
+often — is a separate workstream, not Trail Boss's concern.)
 
 ### Navigator, not relay
 
@@ -94,22 +103,26 @@ interaction sidesteps this entirely.
    `session_id → pane` registry, broadcasts the queue.
 3. **Context extraction** — *what* each session is asking. Largely free from the hook payload
    (see below); transcript tail for deeper/permission context.
-4. **The Trail Boss queue** — a prioritized, keyboard-driven surface, most-stuck-first.
+4. **The Trail Boss queue** — a FIFO depletion surface (oldest-stuck first), keyboard-driven.
 5. **Delivery by navigation** — route the operator to the live pane (tmux), no relay.
 
 ---
 
 ## Detection model
 
-`Stop` and `PermissionRequest` are the two load-bearing signals; `Notification` is optional.
+Two enqueue triggers, treated identically. **Both are required** — they catch *different*
+stuck conditions: a session waiting at a permission prompt is mid-turn and does **not** emit
+`Stop`, so without `PermissionRequest` it would never be detected. `Notification` is dropped.
 
-| Hook | Meaning for the queue | Status |
+| Hook | Why it's needed | Status |
 |------|----------------------|--------|
-| `Stop` | Turn finished; session waiting. **A queue item, always** (per the axiom). Payload carries `last_assistant_message`. | Confirmed firing in both interactive and `-p` (probe 2026-05-25) |
-| `PermissionRequest` | Hard block: a tool wants approval. | Exists; firing/payload **not yet probed** |
-| `Notification` | Attention nudge (long idle, etc.). Supplementary; drop if it adds nothing. | Optional |
-| `UserPromptSubmit` | Input submitted → block resolved → **dequeue**. | Confirmed primitive |
-| `SessionStart` / `SessionEnd` | Register / retire the session. | Confirmed firing (probe) |
+| `Stop` | Turn finished; session waiting for the next instruction. | Confirmed firing in interactive and `-p` (probe 2026-05-25); payload carries `last_assistant_message` |
+| `PermissionRequest` | Session blocked mid-turn on approval — emits **no** `Stop`, so this is the only signal for the permission case. | Exists; firing/payload **not yet probed** (phase 1) |
+| `UserPromptSubmit` | Input submitted → session unstuck → **dequeue**. | Confirmed primitive |
+| `SessionStart` / `SessionEnd` | Register / retire the session (and re-assert `session_id → pane`). | Confirmed firing (probe) |
+| ~~`Notification`~~ | Dropped — `Stop` + `PermissionRequest` cover every stuck case; the dead-letter queue just fills and drains. | Not used |
+
+Both `Stop` and `PermissionRequest` enqueue a plain stuck item with no priority difference.
 
 ---
 
@@ -198,7 +211,7 @@ the live pane. No special edit affordance or `canUseTool` round-trip is required
    │  │  • ingest hooks, upsert state (SQLite)    │             │
    │  │  • session_id → pane registry (self-heal) │             │
    │  │  • transcript reconcile loop (ground truth)│            │
-   │  │  • rank: permission > stopped, oldest-first│            │
+   │  │  • FIFO depletion queue (oldest-stuck 1st)│             │
    │  └───────────────────────┬──────────────────┘             │
    └──────────────────────────┼─────────────────────────────────┘
                               │ presentation (on reattach or keybinding)
@@ -212,7 +225,7 @@ the live pane. No special edit affordance or `canUseTool` round-trip is required
 ### Daemon vs. presentation split
 
 - **Control plane — the daemon.** Always-on; ingests hooks, holds state, runs the reconcile
-  loop, ranks, and issues `tmux` commands to navigate. It drives tmux "from outside" the agent
+  loop, orders the queue FIFO, and issues `tmux` commands to navigate. It drives tmux "from outside" the agent
   panes — it does not need to occupy an agent pane to do so.
 - **Presentation plane — transient & tmux-native.** A keybinding fires `tmux display-popup -E
   trailboss` to overlay the queue on your client; selecting an item runs `switch-client` +
@@ -236,16 +249,58 @@ non-event instead of context loss.
 
 ---
 
-## Queue & ranking
+## Layering: harness-coupled detection vs. harness-agnostic core
 
-- **Membership:** every session in `BLOCKED` (reason `permission` or `stopped`). Reconcile
-  removes any that have progressed.
-- **Ranking:** `permission` (time-sensitive, stalling real progress) ranks above `stopped`
-  (the operator owes it the next instruction but nothing is mid-flight); within a tier, oldest
-  first.
-- **Skip:** advances the cursor without acting; the item stays and re-surfaces (optional small
-  penalty so a just-skipped item doesn't bounce straight back to the top).
-- **Dequeue:** transcript shows progress, or `UserPromptSubmit` fires, or `SessionEnd`.
+The most consequential open architecture question (and a deliberate seam): **at what layer does
+Trail Boss operate?** The two halves want different answers.
+
+- **Switching is already tmux-level and harness-agnostic.** Navigating to a stuck session is
+  `switch-client`/`select-window`/`select-pane %id` — it works for *any* program in a pane,
+  Claude Code or a future coding harness. Nothing about routing is Claude-specific.
+- **Detection is currently Claude-Code-coupled.** The stuck/unstuck signal comes from Claude
+  Code hooks (`Stop`, `PermissionRequest`, `UserPromptSubmit`). That is the reliable signal, but
+  it binds detection to one harness.
+
+To keep the door open for future harnesses without coupling the core, put detection behind an
+**adapter interface**. The daemon consumes a normalized event — *"session S at pane P became
+stuck / unstuck"* — and everything downstream (queue, FIFO depletion, navigation) is
+harness-agnostic. Adapters produce that normalized event however they can:
+
+- **Claude Code adapter (v1):** hooks → normalized event. Reliable, confirmed.
+- **Future harness adapters:** their own hooks if they have them; else log/transcript tailing;
+  else a tmux-level heuristic (e.g. pane output gone quiet at a prompt). Less reliable, but the
+  core doesn't change.
+
+**Decision for v1:** build the Claude Code adapter (hooks), but define the daemon's input as the
+normalized stuck/unstuck event — *not* raw hook payloads — so the harness coupling stays
+isolated to the adapter. The reliability of detection is the adapter's problem; switching is
+always tmux. **Open:** the exact normalized event contract, and whether a purely tmux-level
+detector (no hooks) is viable as a universal fallback.
+
+---
+
+## Queue & interaction loop (depletion)
+
+The queue is a flat FIFO dead-letter queue, and the interaction model is **auto-advance
+depletion**: you are always looking at one stuck session; when you finish with it, the next one
+loads.
+
+- **Membership:** every stuck session (from `Stop` or `PermissionRequest`). No priority between
+  reasons; `reason` is display-only. Reconcile removes any that have progressed.
+- **Order:** oldest-stuck first (FIFO). The head of the queue is "the current session."
+- **Auto-advance:** the operator's focus is navigated to the current session. When that session
+  resolves — `UserPromptSubmit` fires (you responded) or you `skip` — Trail Boss **loads the
+  next** stuck session into focus. The operator drains the queue one session at a time without
+  ever choosing "which next."
+- **Skip:** advances to the next without acting; the skipped session stays in the queue and
+  re-surfaces later in the cycle.
+- **Dequeue:** transcript advances past the last stuck point, or `UserPromptSubmit` fires, or
+  `SessionEnd`.
+- **Empty queue:** nothing stuck → no auto-advance; the operator is free. New stuck sessions
+  re-arm the loop.
+
+Saturation is a non-issue by construction: the queue can be arbitrarily long; the operator just
+keeps depleting it, and the next-in-line always loads. There is no ceiling logic.
 
 ---
 
@@ -277,14 +332,17 @@ Still **unverified** (probe before depending on): `PermissionRequest` firing + p
    already confirmed.
 2. **Emitter** — `trailboss-emit.sh` (carries `$TMUX_PANE` on every event) + the `settings.json`
    hook wiring.
-3. **Daemon (control plane)** — ingest endpoint, SQLite state, self-healing registry, the
-   transcript reconcile loop, ranking. Runs in its own tmux window.
-4. **Navigation** — `switch-client`/`select-window`/`select-pane` to route to a pane by id.
+3. **Daemon (control plane)** — ingest endpoint behind the normalized stuck/unstuck adapter
+   contract, SQLite state, self-healing registry, the transcript reconcile loop, FIFO queue.
+   Runs in its own tmux window.
+4. **Navigation** — `switch-client`/`select-window`/`select-pane` to route to a pane by id, and
+   auto-advance to the next stuck session on resolve/skip.
 5. **Presentation** — `display-popup` queue overlay + keybinding; optional status-line segment.
-6. **Close the loop (walking skeleton)** — stuck pane → appears in popup → select → land on the
-   live pane → interact → reconcile dequeues it. This end-to-end path is the first milestone.
-7. Iterate: ranking policy, skip penalty, embedded `link-window` view, reboot-durable systemd
-   unit.
+6. **Close the loop (walking skeleton)** — stuck pane → loaded into focus → interact → reconcile
+   dequeues it → next stuck session auto-loads. This end-to-end depletion path is the first
+   milestone.
+7. Iterate: auto-advance trigger tuning, skip/re-surface behavior, embedded `link-window` view,
+   and a second harness adapter to validate the abstraction.
 
 ---
 
@@ -301,8 +359,8 @@ Still **unverified** (probe before depending on): `PermissionRequest` firing + p
 - *Daemon restart:* SQLite persists rows; current blocked-status is rebuilt from transcripts.
 - *Pane reused / session resumed:* next event re-asserts `session_id → pane`; navigation always
   targets the pane in the latest event.
-- *Host reboot:* tmux server (and thus everything) is lost unless the daemon is a `systemd`
-  unit and agents are relaunched — out of scope for v1, noted for later.
+- *Host reboot:* tmux server (and thus everything) is lost. **v1: the operator re-invokes Trail
+  Boss and relaunches sessions manually after a restart** — no auto-resurrection.
 - *Stale navigation target:* worst case you land on a pane that already moved on; reconcile
   would have dequeued it, so the popup shouldn't have offered it — acceptable, non-destructive.
 
@@ -310,17 +368,27 @@ Still **unverified** (probe before depending on): `PermissionRequest` firing + p
 
 ## Open questions
 
-1. **`PermissionRequest` specifics** — firing conditions across gate types and payload shape
-   (the proposed command/tool). The last real unknown; phase 1.
-2. **`Notification` value-add** — does it surface anything `Stop` + `PermissionRequest` miss? If
-   not, drop it.
-3. **Multi-client targeting** — if more than one tmux client is attached, which does
-   `switch-client`/`display-popup` target? Pick the active one; confirm behavior.
-4. **Popup UX** — does a `display-popup` queue + jump feel fast enough, or is a dedicated
-   always-visible window better? Decide after the walking skeleton.
-5. **Permission rendering** — for a `permission` item, how much of the proposed command to show
-   in the popup (transcript tail vs. payload) before you jump to the pane.
-6. **Reboot durability** — `systemd --user` for the daemon + an agent-relaunch story, if/when
-   reboot-survival matters.
-7. **Concurrency ceiling** — at what session count does the operator saturate regardless of
-   routing? The router buys throughput, not infinite capacity.
+**Open**
+
+1. **Harness layering / adapter contract** *(the main one)* — define the normalized
+   stuck/unstuck event the daemon consumes, so detection stays isolated to a per-harness
+   adapter. Is a purely tmux-level detector (no hooks) viable as a universal fallback for future
+   harnesses? See "Layering" above.
+2. **`PermissionRequest` specifics** — confirm it fires for the gate types you hit and what its
+   payload carries (the proposed command, for display). Detection coverage depends on it; phase 1.
+3. **Auto-advance trigger** — exactly what counts as "done with the current session" →
+   load next: `UserPromptSubmit` and explicit `skip` are clear; should manually navigating away
+   also advance? And is the jump immediate or on a keypress?
+4. **Presentation UX** — `display-popup` queue + jump vs. a dedicated always-visible window;
+   decide after the walking skeleton.
+
+**Resolved this round (recorded so they don't get re-litigated)**
+
+- *Permission vs. stopped priority* → none. Stuck is stuck; `reason` is display-only, queue is
+  FIFO.
+- *`Notification`* → dropped; `Stop` + `PermissionRequest` cover every stuck case.
+- *Multiple tmux clients* → not a real scenario; one active focus, auto-advanced through the
+  queue (single-operator non-goal).
+- *Reboot durability* → out; operator re-invokes after restart.
+- *Concurrency ceiling* → non-issue; the depletion loop just loads the next one, no ceiling
+  logic.
