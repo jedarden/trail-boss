@@ -9,23 +9,27 @@ Code's hook surface evolves and some semantics are undocumented.
 ## 1. DETECT — which hook says a session is blocked
 
 Hooks live in `~/.claude/settings.json` (user-global) or `.claude/settings.json` (per-project).
-Each `command` hook receives the **event JSON on stdin**, so a one-liner that pipes stdin to
-the collector is enough:
+Each `command` hook receives the **event JSON on stdin**. **Every** hook routes through the same
+`trailboss-emit.sh` — a thin wrapper that forwards stdin *and* injects `$TMUX_PANE` from the
+environment (the pane is not in the payload; see §2). A bare `curl` of stdin alone is **not**
+enough, because it would drop the env-only pane mapping. `SessionStart` is **not** special — it
+uses the same emitter; the registry self-heals on every event:
 
 ```json
 {
   "hooks": {
-    "PermissionRequest": [
-      { "hooks": [ { "type": "command",
-                     "command": "curl -s -X POST http://localhost:4000/event --data-binary @-" } ] }
-    ],
+    "PermissionRequest": [ { "hooks": [ { "type": "command", "command": "~/.claude/trailboss-emit.sh" } ] } ],
     "Stop":              [ { "hooks": [ { "type": "command", "command": "~/.claude/trailboss-emit.sh" } ] } ],
     "UserPromptSubmit":  [ { "hooks": [ { "type": "command", "command": "~/.claude/trailboss-emit.sh" } ] } ],
-    "SessionStart":      [ { "hooks": [ { "type": "command", "command": "~/.claude/trailboss-register.sh" } ] } ],
+    "SessionStart":      [ { "hooks": [ { "type": "command", "command": "~/.claude/trailboss-emit.sh" } ] } ],
     "SessionEnd":        [ { "hooks": [ { "type": "command", "command": "~/.claude/trailboss-emit.sh" } ] } ]
   }
 }
 ```
+
+`trailboss-emit.sh` is essentially:
+`curl -s -X POST http://localhost:4000/event --data-binary @- -H "X-Tmux-Pane: $TMUX_PANE"`
+(or it merges `$TMUX_PANE` into the JSON body before POSTing).
 
 Events relevant to "needs a human":
 

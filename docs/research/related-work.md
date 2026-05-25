@@ -15,8 +15,8 @@ layer** Trail Boss needs: hooks → collector → live UI, keyed by `session_id`
 **How Trail Boss differs:** it is *observability*, not *action*. It shows *that* a session is
 waiting; Trail Boss adds the missing half — surfacing the blocked session and **navigating the
 operator to the live pane** to act on it (it never injects input; see "Navigator, not relay" in
-the plan). Its collector is a strong starting point to fork; Trail Boss extends the read-only
-event store with a self-healing session→pane registry and a tmux navigation layer. It reuses the
+the plan). Its collector is a strong starting point to fork; Trail Boss extends disler's
+append-only event store with a self-healing session→pane registry and a tmux navigation layer. It reuses the
 SQLite event store, not the WebSocket/browser-UI layer (presentation is tmux, not a web app).
 
 ### [`langchain-ai/agent-inbox`](https://github.com/langchain-ai/agent-inbox)

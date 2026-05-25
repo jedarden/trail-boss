@@ -125,6 +125,7 @@ stuck conditions: a session waiting at a permission prompt is mid-turn and does 
 | `SessionStart` | Register the session; re-assert `session_id → pane`. | Confirmed firing (probe) |
 | `SessionEnd` | Retire the session. | Exists; firing not yet probed |
 | ~~`Notification`~~ | Dropped — `Stop` + `PermissionRequest` cover every stuck case; the dead-letter queue just fills and drains. | Not used |
+| ~~`SubagentStop`~~ | Ignored — a subagent finishing is not a human-input point. | Not used |
 
 Both `Stop` and `PermissionRequest` enqueue a plain stuck item with no priority difference.
 
