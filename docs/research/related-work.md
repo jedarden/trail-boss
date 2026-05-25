@@ -45,5 +45,7 @@ loop** (oldest-stuck first, no priority) tuned for an operator draining many liv
   (SQLite + hook ingest) is a clean fork point; extend it with the self-healing session→pane
   registry and the tmux navigation layer. Drop its WebSocket/browser-UI half — Trail Boss's
   presentation is tmux (`display-popup`), not a web client.
-- **Inbox UX patterns** → `langchain-ai/agent-inbox` for the accept/respond/ignore interaction
-  model, mapped onto Trail Boss's two stuck reasons (`permission`, `stopped`).
+- **Inbox UX patterns** → `langchain-ai/agent-inbox` for the queue-of-pending-items shape only.
+  Trail Boss's own actions stay **navigate-and-reply** (in the live pane) or **skip** — there is
+  no accept/edit/ignore, since those happen natively in the pane (navigator, not relay). Items
+  carry one of the two stuck reasons (`permission`, `stopped`) for display.

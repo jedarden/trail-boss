@@ -68,7 +68,8 @@ alternatives are in [`../notes/decisions.md`](../notes/decisions.md).)
 - **Not a remote web product.** It is a same-host, tmux-native tool whose sole job is to
   eliminate manual tab-switching. Remote access is out of scope for v1.
 - **Not dependent on plan mode.** Vanilla Claude Code plan mode is assumed disabled (the
-  operator uses their own); `reason` collapses to **permission** and **stopped/needs-next**.
+  operator uses their own); the `reason` enum is exactly two values — **`permission`** and
+  **`stopped`**.
 
 ---
 
@@ -292,7 +293,10 @@ loads.
 
 - **Membership:** every stuck session (from `Stop` or `PermissionRequest`). No priority between
   reasons; `reason` is display-only. Reconcile removes any that have progressed.
-- **Order:** oldest-stuck first (FIFO). The head of the queue is "the current session."
+- **Order:** oldest-**ready**-stuck first (FIFO). The head of the queue is "the current
+  session." An item whose skip-cooldown is still active is not eligible to be the head — the
+  daemon advances to the next ready item; if none are ready, the queue presents as empty until a
+  cooldown expires or a new event arrives.
 - **Auto-advance (no forced focus-steal):** the operator works the *current* session in its
   live pane. When that session resolves — `UserPromptSubmit` fires (you responded) or you
   `skip` — the daemon **computes** the next head of queue, but the actual jump is

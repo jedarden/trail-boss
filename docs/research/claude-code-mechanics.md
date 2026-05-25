@@ -37,7 +37,7 @@ Events relevant to "needs a human":
 |-------|----------------------|------------|
 | `Stop` | **Turn finished; session waiting for the next instruction.** Enqueue a stuck item. | Confirmed firing (probe) |
 | `PermissionRequest` | Session blocked mid-turn on approval. Emits **no** `Stop`, so it is the only signal for the permission case. Enqueue a stuck item. | Exists; firing/payload not yet probed |
-| `SubagentStop` | A subagent finished — usually *not* a human-input point; ignore. | Confirmed |
+| `SubagentStop` | A subagent finished — *not* a human-input point; ignored. | Exists; not probed (ignored regardless) |
 | `UserPromptSubmit` | Human submitted input → block resolved → **dequeue**. | Confirmed |
 | `SessionStart` | Register the session; capture `$TMUX_PANE`. | Confirmed firing (probe) |
 | `SessionEnd` | Retire the session. | Exists; firing not yet probed |
@@ -66,6 +66,8 @@ Every hook payload includes stable identifiers:
 }
 ```
 
+- `permission_mode` — captured as-is for display only; Trail Boss does not branch on it (the
+  `plan` value can appear in the payload even though vanilla plan mode is a non-goal).
 - `session_id` — primary key; stable across resume/fork.
 - `cwd` — derive the project/repo label.
 - `transcript_path` — the JSONL to tail for context.
