@@ -6,10 +6,20 @@ order — Trail Boss is the single pane where it reports in. You ride over, set 
 wave it on), and your reply lands back in the exact session — so you stop hand-cycling
 terminal windows hunting for whoever's stuck.**
 
-Trail Boss inverts the human-in-the-loop bottleneck. Instead of *you* polling many concurrent
-agent sessions to find the one that needs you, each stuck session raises its hand and Trail
-Boss presents them as one **prioritized queue — most-stuck first**. Read the context, give the
-order (reply), or wave it on (skip).
+## Human *on* the loop, not *in* it
+
+Trail Boss turns human-**in**-the-loop into human-**on**-the-loop. Classic agentic HITL wires
+you into the inner cycle — approving each step, answering each prompt — so you are the
+bottleneck on every iteration. Trail Boss flips it: agents run autonomously by default and you
+supervise from above, engaged only by **exception**. When an agent can't proceed on its own —
+needs a decision, hits a permission gate, or exhausts its turn — it falls through to you.
+
+Put plainly, **the human is the failure mode.** Trail Boss is a **dead-letter queue for a fleet
+of agents**: the happy path never touches you; only stalled work routes to you, you process the
+exception (reply or skip), and it goes back on the wire. Instead of *you* polling many sessions
+to find the one that needs you, each stuck session raises its hand and Trail Boss presents them
+as one **prioritized queue — most-stuck first**. Read the context, give the order (reply), or
+wave it on (skip).
 
 ```
 ┌─ TRAIL BOSS ────────────────────────────────────────────── 3 stuck ───┐
@@ -41,7 +51,8 @@ periodically stalls waiting on a human:
 Discovering those stalls by manually cycling windows is the bottleneck — with N sessions,
 most of your time goes to *finding* the one that needs you, not *answering* it, and a session
 can sit blocked for minutes while otherwise-parallel work waits. The human is the scarce
-resource; the system should route the human's attention, not the other way around.
+resource; the system should route the human's attention, not the other way around — engaging
+you by exception, not on every step.
 
 ## How it works
 
