@@ -2,6 +2,7 @@
 # Trail Boss CLI — navigation commands for tmux integration
 set -e
 
+TB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 DAEMON_URL="${TRAILBOSS_URL:-http://127.0.0.1:4000}"
 
 case "$1" in
@@ -48,9 +49,8 @@ case "$1" in
     ;;
 
   popup)
-    # Show the queue picker (Phase 5)
-    echo "Trail Boss: popup not yet implemented" >&2
-    exit 1
+    # Show the queue picker overlay
+    exec "$TB_DIR/bin/trailboss-popup"
     ;;
 
   *)

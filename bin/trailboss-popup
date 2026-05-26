@@ -1,0 +1,103 @@
+#!/bin/bash
+# Trail Boss queue picker — display-popup overlay
+# Shows stuck sessions with index-based selection
+set -e
+
+DAEMON_URL="${TRAILBOSS_URL:-http://127.0.0.1:4000}"
+
+# Fetch queue from daemon
+QUEUE_JSON=$(curl -s "$DAEMON_URL/queue")
+
+# Parse using python3 for reliable JSON handling
+QUEUE_OUTPUT=$(python3 -c "
+import json, sys
+try:
+    data = json.load(sys.stdin)
+    items = data.get('items', [])
+    count = data.get('count', 0)
+    print(count)
+    for i, item in enumerate(items, 1):
+        session_id = item.get('session_id', '')[:8]
+        pane_id = item.get('pane_id', '')
+        reason = item.get('reason', 'unknown')
+        cwd = item.get('cwd', '')
+        message = item.get('last_message', '')[:60]
+        project = cwd.split('/')[-1] if cwd else 'unknown'
+        print(f'{i}|{pane_id}|{session_id}|{reason}|{project}|{message}')
+except Exception as e:
+    print(f'Error: {e}', file=sys.stderr)
+    sys.exit(1)
+" <<< "$QUEUE_JSON")
+
+if [ $? -ne 0 ]; then
+  echo "Failed to parse queue response"
+  read -n 1 -s
+  exit 1
+fi
+
+COUNT=$(echo "$QUEUE_OUTPUT" | head -n 1)
+if [ -z "$COUNT" ] || [ "$COUNT" = "0" ]; then
+  cat <<'EOF'
+╔════════════════════════════════════════╗
+║     Trail Boss — All Clear 🎉          ║
+║                                        ║
+║      No stuck sessions right now       ║
+╚════════════════════════════════════════╝
+
+Press any key to close.
+EOF
+  read -n 1 -s
+  exit 0
+fi
+
+# Build the display
+cat <<EOF
+╔════════════════════════════════════════════════════════════════════╗
+║  Trail Boss Queue — $COUNT stuck session$( [ "$COUNT" -ne 1 ] && echo s )                              ║
+╠════════════════════════════════════════════════════════════════════╣
+EOF
+
+# Print each item with index
+echo "$QUEUE_OUTPUT" | tail -n +2 | while IFS='|' read -r index pane_id session_id reason project message; do
+  # Format: [1] stopped — trail-boss — what the agent said...
+  printf "║ [%2d] %-8s — %-20s — %s%s ║\n" "$index" "$reason" "$project" "$message" \
+    "$( [ ${#message} -ge 60 ] && echo '...' || echo ''   )"
+done
+
+cat <<'EOF'
+╠════════════════════════════════════════════════════════════════════╣
+║  Enter number to jump, or q to quit                                ║
+╚════════════════════════════════════════════════════════════════════╝
+EOF
+
+read -r -p "> " CHOICE
+
+if [ "$CHOICE" = "q" ] || [ "$CHOICE" = "Q" ]; then
+  exit 0
+fi
+
+# Validate selection is a number within range
+if ! [[ "$CHOICE" =~ ^[0-9]+$ ]] || [ "$CHOICE" -lt 1 ] || [ "$CHOICE" -gt "$COUNT" ]; then
+  echo "Invalid selection"
+  sleep 1
+  exit 0
+fi
+
+# Extract pane_id for selected item
+SELECTED_PANE=$(echo "$QUEUE_OUTPUT" | tail -n +2 | sed -n "${CHOICE}p" | cut -d'|' -f2)
+
+if [ -z "$SELECTED_PANE" ]; then
+  echo "Failed to get pane for selection $CHOICE"
+  sleep 1
+  exit 1
+fi
+
+# Navigate to the selected pane
+SESSION_NAME=$(tmux display -p -t "$SELECTED_PANE" '#{session_name}')
+if [ -z "$SESSION_NAME" ]; then
+  echo "Pane $SELECTED_PANE not found"
+  sleep 1
+  exit 1
+fi
+
+tmux switch-client -t "$SESSION_NAME" \; select-window -t "$SELECTED_PANE" \; select-pane -t "$SELECTED_PANE"

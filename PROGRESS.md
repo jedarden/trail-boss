@@ -77,7 +77,23 @@
 **Next:**
 - Phase 5: Presentation — tmux keybindings, display-popup queue picker, status-line segment
 
-## Phase 5: Presentation (PENDING)
+## Phase 5: Presentation ✅ COMPLETE
+
+**Done:** Implemented presentation layer — popup queue picker, keybindings, and status-line segment.
+
+**Verified:**
+- `trailboss popup` displays FIFO list with index-based selection
+- Keybindings configured (prefix+Tab for Next, prefix+s for Skip, prefix+g for Popup)
+- Status-line segment shows "⚠ N" when stuck sessions exist
+- Exit criterion passed: all presentation components work
+
+**Files:**
+- `bin/trailboss-popup` — queue picker with python3 JSON parsing, box drawing UI
+- `bin/trailboss-status` — status-line segment showing stuck count
+- `tmux.conf` — keybindings for Next/Skip/Popup
+
+**Next:**
+- Phase 6: Walking Skeleton — end-to-end acceptance scenarios (AS-1 through AS-7)
 
 ## Phase 6: Walking Skeleton (PENDING)
 

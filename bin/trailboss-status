@@ -1,0 +1,24 @@
+#!/bin/bash
+# Trail Boss status-line segment — shows stuck count
+# Usage in tmux.conf: set -g status-right '#[fg=colour196,bold]#(trailboss-status)#[default] | %H:%M'
+DAEMON_URL="${TRAILBOSS_URL:-http://127.0.0.1:4000}"
+
+# Fetch status from daemon (timeout 100ms for responsiveness)
+STATUS=$(curl -s --max-time 0.1 "$DAEMON_URL/status" 2>/dev/null || echo '{"stuckCount":-1}')
+
+# Extract count using python3 for reliable parsing
+RESULT=$(python3 -c "
+import json, sys
+try:
+    data = json.load(sys.stdin)
+    count = data.get('stuckCount', -1)
+    if count > 0:
+        print(count)
+except:
+    pass
+" <<< "$STATUS")
+
+# Output with warning icon if stuck, empty otherwise
+if [ -n "$RESULT" ] && [ "$RESULT" != "0" ]; then
+  echo "⚠ $RESULT"
+fi
