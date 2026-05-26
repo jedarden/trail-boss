@@ -1,0 +1,16 @@
+{
+  "name": "trailboss",
+  "version": "0.1.0",
+  "description": "Single-pane attention router for interactive AI coding-agent sessions",
+  "type": "module",
+  "scripts": {
+    "daemon": "bun run daemon/index.ts",
+    "test": "bun test"
+  },
+  "dependencies": {
+    "bun": "^1.1.0"
+  },
+  "devDependencies": {
+    "@types/bun": "^1.1.0"
+  }
+}
