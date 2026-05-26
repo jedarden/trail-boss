@@ -1,0 +1,7 @@
+# Marathon: keep host-specific/internal config and runtime state local
+.marathon/env
+.marathon/logs/
+.marathon/*-config/
+
+# Beads: db is regenerable from issues.jsonl
+.beads/*.db
