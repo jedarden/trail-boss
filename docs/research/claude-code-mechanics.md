@@ -12,7 +12,7 @@ Hooks live in `~/.claude/settings.json` (user-global) or `.claude/settings.json`
 Each `command` hook receives the **event JSON on stdin**. **Every** hook routes through the same
 `trailboss-emit.sh` — a thin wrapper that forwards stdin *and* injects `$TMUX_PANE` from the
 environment (the pane is not in the payload; see §2). A bare `curl` of stdin alone is **not**
-enough, because it would drop the env-only pane mapping. `SessionStart` is **not** special — it
+enough, because it would drop the env-only pane mapping emitter test. `SessionStart` is **not** special — it
 uses the same emitter; the registry self-heals on every event:
 
 ```json
@@ -36,7 +36,7 @@ Events relevant to "needs a human":
 | Event | Meaning for the queue | Confidence |
 |-------|----------------------|------------|
 | `Stop` | **Turn finished; session waiting for the next instruction.** Enqueue a stuck item. | Confirmed firing (probe) |
-| `PermissionRequest` | Session blocked mid-turn on approval. Emits **no** `Stop`, so it is the only signal for the permission case. Enqueue a stuck item. | Exists; firing/payload not yet probed |
+| `PermissionRequest` | Session blocked mid-turn on approval. Emits **no** `Stop`, so it is the only signal for the permission case. Enqueue a stuck item. | **Confirmed firing + payload (probe 2026-05-25)** |
 | `SubagentStop` | A subagent finished — *not* a human-input point; ignored. | Exists; not probed (ignored regardless) |
 | `UserPromptSubmit` | Human submitted input → block resolved → **dequeue**. | Confirmed |
 | `SessionStart` | Register the session; capture `$TMUX_PANE`. | Confirmed firing (probe) |
@@ -92,6 +92,36 @@ dir). So identity is available both as env vars and in the payload.
 the agent just said — so the queue can render context straight from the hook. It also carries
 `permission_mode`, `effort`, `stop_hook_active`, `background_tasks`, `session_crons`. This makes
 transcript tailing an enhancement, not a requirement, for the stopped case.
+
+### From the `PermissionRequest` payload directly (primary for permission blocks)
+
+**Confirmed (probe 2026-05-25):** the `PermissionRequest` payload includes the proposed tool
+operation in `tool_name` + `tool_input`:
+
+```json
+{
+  "session_id": "3247c672-a84c-4907-87e6-a7997ea2a0e3",
+  "transcript_path": "/home/coding/.claude/projects/-home-coding-scratch-trail-boss-probe/3247c672-a84c-4907-87e6-a7997ea2a0e3.jsonl",
+  "cwd": "/home/coding/scratch/trail-boss-probe",
+  "permission_mode": "default",
+  "effort": {"level": "high"},
+  "hook_event_name": "PermissionRequest",
+  "tool_name": "Edit",
+  "tool_input": {
+    "file_path": "/home/coding/scratch/trail-boss-probe/test-file.txt",
+    "old_string": "This is a test file for probing PermissionRequest.",
+    "new_string": "This is a test file for probing PermissionRequest.\nPermission probe test",
+    "replace_all": false
+  },
+  "permission_suggestions": [
+    {"type": "setMode", "mode": "acceptEdits", "destination": "session"}
+  ]
+}
+```
+
+The `tool_name` indicates the tool type (`Edit`, `Bash`, `Write`, etc.) and `tool_input` carries
+the full parameters — exactly what the queue needs to display "what the session is asking."
+`permission_suggestions` is present but not needed for Trail Boss (display-only, no branch logic).
 
 ### Transcript JSONL (deeper context)
 
@@ -155,7 +185,7 @@ tmux link-window -s <src-session>:<window> -t trailboss: ; tmux unlink-window -t
 | Need | Primitive | Identifier / flag | Confidence |
 |------|-----------|-------------------|------------|
 | Detect waiting for next instruction | `Stop` hook | stdin JSON | confirmed firing (probe) |
-| Detect permission block | `PermissionRequest` hook | stdin JSON | exists; not yet probed |
+| Detect permission block | `PermissionRequest` hook | stdin JSON | **confirmed firing + payload (probe 2026-05-25)** |
 | Detect resolved block | `UserPromptSubmit` hook | `session_id` | confirmed |
 | Correlate to session/repo | any hook payload + env | `session_id`, `cwd`, `transcript_path`, `CLAUDE_CODE_SESSION_ID` | confirmed (probe) |
 | Correlate to tmux pane | any emit hook | `$TMUX_PANE` (in hook env) | confirmed (probe) |
