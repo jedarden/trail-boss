@@ -25,15 +25,57 @@
 
 **Goal:** Build the daemon with ingest endpoint, SQLite state, self-healing registry, transcript reconcile loop, and FIFO queue.
 
-**Next:**
-- Choose tech stack (Bun + SQLite per plan, or alternative)
-- Design normalized stuck/unstuck adapter contract
-- Implement ingest endpoint (loopback only)
-- Implement SQLite state + session_id → pane registry
-- Implement transcript reconcile loop
-- Implement FIFO queue with /next and /skip endpoints
+**Done:**
+- Chose Bun + SQLite stack
+- Designed normalized stuck/unstuck adapter contract (claude-adapter.ts)
+- Implemented ingest endpoint on loopback only (127.0.0.1:4000/event)
+- Implemented SQLite state with session_id → pane registry
+- Implemented transcript reconcile loop (runs every 5s)
+- Implemented FIFO queue with /next and /skip endpoints
+- Added /status and /queue endpoints for health and listing
 
-## Phase 4: Navigation (PENDING)
+**Verified via synthetic event testing:**
+- Sessions enter queue on Stop/PermissionRequest and leave on UserPromptSubmit
+- Second event with new pane updates registry (self-heal)
+- Reconcile loop dequeues sessions whose transcript advanced
+- GET /next returns oldest-ready pane id (respects skip cooldown)
+- State survives daemon restart
+
+**Files:**
+- `daemon/index.ts` — main HTTP server
+- `daemon/types.ts` — normalized event types
+- `daemon/claude-adapter.ts` — Claude Code hook adapter
+- `daemon/db.ts` — SQLite state layer
+- `daemon/reconcile.ts` — transcript reconcile loop
+- `daemon/schema.sql` — database schema
+- `package.json` — dependencies
+- `test-daemon.sh` — basic synthetic event tests
+- `test-daemon-phase3.sh` — Phase 3 exit criteria tests
+
+**Tech stack decision:** Bun + SQLite
+- Fast startup, low memory footprint
+- Built-in SQLite support (no native module compilation)
+- Modern TypeScript/JavaScript ecosystem
+- Single-file deployment easy
+
+**Next:**
+- Phase 4: Navigation — implement trailboss jump-next that switches to the pane
+
+## Phase 4: Navigation ✅ COMPLETE
+
+**Done:** Implemented `trailboss` CLI with `jump-next` and `skip` commands.
+
+**Verified:**
+- `jump-next` queries `/next` and navigates via `switch-client`/`select-window`/`select-pane`
+- `skip` posts `/skip` then jumps to new head
+- Exit criterion passed: navigation lands operator on pane returned by `/next`
+
+**Files:**
+- `bin/trailboss` — main CLI (jump-next, skip, popup stub)
+- `test-navigation.sh` — synthetic event test verifying navigation
+
+**Next:**
+- Phase 5: Presentation — tmux keybindings, display-popup queue picker, status-line segment
 
 ## Phase 5: Presentation (PENDING)
 
