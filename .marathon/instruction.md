@@ -29,8 +29,15 @@ This repository (the marathon runs with its CWD set to the repo root). Use **rel
 
 ## Current state
 
-Design is complete; **no implementation code exists yet**. The marathon starts at Phase 1.
-Track progress in `PROGRESS.md` at the repo root (create it on the first iteration).
+Phases 1–5 are **complete**. Phase 6 (Walking Skeleton) is next.
+
+- Phase 1 (Probe): done — findings in `docs/research/claude-code-mechanics.md`
+- Phase 2 (Emitter): done — `.claude/trailboss-emit.sh` + `.claude/settings.json`
+- Phase 3 (Daemon): done — `daemon/` (Bun + SQLite), `package.json`
+- Phase 4 (Navigation): done — `bin/trailboss` (jump-next, skip)
+- Phase 5 (Presentation): done — `bin/trailboss-popup`, `bin/trailboss-status`, `tmux.conf`
+
+Read `PROGRESS.md` for per-phase details and the current next action.
 
 ## Iteration protocol
 
