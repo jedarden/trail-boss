@@ -42,10 +42,13 @@ Each iteration:
    foundational work first. Stay focused on a single coherent change.
 3. **Implement** — write the code/scripts. Follow the settled design in the docs; if you make
    a new design decision, record it in `docs/notes/decisions.md`.
-4. **Verify** — actually exercise what you built (run the script, hit the endpoint, fire the
-   hook). Don't mark something done on code-read alone. For hook/tmux behavior, test in a
-   throwaway tmux session under `~/scratch` or a temp dir — never disturb other tmux sessions,
-   and never `send-keys` into panes you don't own.
+4. **Verify against the definition of done** — a phase is done only when its **exit criterion**
+   in `docs/plan/plan.md` → "Testing & validation" is observably true (Phase 6 requires
+   acceptance scenarios AS-1…AS-6 to pass). Actually exercise what you built (run the script,
+   hit the endpoint, fire the hook) using the test harness described there — synthetic event
+   injection for daemon/queue logic, throwaway tmux sessions under `~/scratch` for hook/tmux
+   behavior. Don't mark anything done on code-read alone. Never disturb tmux sessions you don't
+   own, and never `send-keys` into panes you don't own.
 5. **Commit + push** — mandatory every iteration: `git add` the specific files, commit with a
    conventional message (`feat(scope): …`, `fix(scope): …`, `docs(scope): …`), then
    `git push origin main`. Origin mirrors to GitHub automatically.

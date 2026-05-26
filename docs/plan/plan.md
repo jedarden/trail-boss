@@ -399,6 +399,75 @@ Still **unverified** (probe before depending on): `PermissionRequest` firing + p
 
 ---
 
+## Testing & validation
+
+This system is almost entirely process and tmux side-effects, so "it compiles" proves nothing.
+Each phase has an observable **exit criterion** (its definition of done), the walking skeleton
+has **acceptance scenarios** that must pass end-to-end, and there is a **test harness** that
+exercises behavior without burning model quota.
+
+### Per-phase exit criteria (definition of done)
+
+| Phase | Done when (observable) |
+|-------|------------------------|
+| 1. Probe `PermissionRequest` | A captured `PermissionRequest` payload is recorded in `docs/research/claude-code-mechanics.md`, showing the field that carries the proposed tool/command, confirmed for the gate types in use (a bash command, a file edit). Confirmed that a permission block fires `PermissionRequest` and **no** `Stop`. |
+| 2. Emitter | With the hooks wired, a real session that stops / hits a permission / submits input causes a stub collector to log POSTs whose body carries `session_id`, `cwd`, **and** `$TMUX_PANE`. A bare-`curl` control (no emit script) is shown to drop `$TMUX_PANE` — proving the wrapper is required. |
+| 3. Daemon | Synthetic events POSTed to the loopback endpoint produce correct state: a session enters the queue on `Stop`/`PermissionRequest` and leaves on `UserPromptSubmit`; a second event with a new pane updates the registry (self-heal); the reconcile loop dequeues a session whose transcript advanced past its last stuck point; `GET /next` returns the oldest-ready pane id; state survives a daemon restart (rebuilt from transcripts). |
+| 4. Navigation | `trailboss jump-next` lands the operator's tmux client on the pane id returned by `/next` — verified by asserting `tmux display -p '#{pane_id}'` equals the target after the jump. |
+| 5. Presentation | The Next and Skip keybindings and the `display-popup` picker work: Next jumps to the head-of-queue pane; the popup lists the queue with `reason` + `last_assistant_message` snippet; the status-line shows the correct stuck count. |
+| 6. Walking skeleton | Acceptance scenarios AS-1 … AS-6 below all pass end-to-end. |
+| 7. Iterate | Each enhancement ships with its own added acceptance scenario (e.g., the embedded `link-window` view, the second harness adapter). |
+
+### Acceptance scenarios (the walking skeleton must pass all)
+
+- **AS-1 — single permission block:** a session runs a tool needing approval → within a few
+  seconds it appears in the queue with `reason=permission` and the proposed command visible →
+  Next lands the operator on that pane → approving fires `UserPromptSubmit` → reconcile
+  dequeues it → queue empty.
+- **AS-2 — FIFO ordering:** session A stops, then session B stops a minute later → the queue
+  head is A (oldest) → resolving A and pressing Next lands on B.
+- **AS-3 — answered-in-pane (reconcile):** a stopped session is queued; the operator answers it
+  *directly in its pane* (not via Trail Boss) → the new transcript entry causes reconcile to
+  dequeue it with no UI action.
+- **AS-4 — dropped-event recovery:** the collector is down when a `Stop` fires (POST lost); on
+  restart, the reconcile sweep rebuilds the queue from transcripts and the session appears.
+- **AS-5 — skip + cooldown:** queue = [A, B]; Skip on A lands on B and moves A to the tail with
+  a cooldown; while the cooldown is active and B is resolved, the queue presents as **empty**
+  (A is not eligible as head) until the cooldown expires, then A reappears.
+- **AS-6 — no forced focus-steal:** while the operator is typing in some pane that is *not* the
+  queue head, a session resolving does **not** auto-switch their client; the jump happens only
+  on a Next/Skip keypress.
+- **AS-7 — pane reuse (regression):** a session ends and its pane is reused by a new session;
+  the new session's first event re-asserts `session_id → pane`, and navigation targets the
+  current pane, never the retired one.
+
+### Test harness & approach
+
+- **Throwaway tmux isolation:** all behavioral tests spawn uniquely-named tmux sessions in a
+  temp dir / `~/scratch`, assert via `capture-pane`, collector logs, or SQLite, and tear down.
+  Never touch panes the test doesn't own; never `send-keys` into foreign sessions.
+- **Synthetic event injection (unit-level, no quota):** POST hand-crafted hook payloads to the
+  daemon's loopback endpoint to drive queue/registry/reconcile logic deterministically without
+  a live agent. This is the primary way to test phases 3–5 fast.
+- **Transcript fixtures:** feed canned JSONL transcripts to the reconcile loop to assert the
+  dequeue decision (advanced-past-stuck → drop).
+- **Mock hook emitter:** a tiny script that fires `Stop`/`PermissionRequest` with a chosen
+  `session_id` + `$TMUX_PANE`, so the daemon and navigation can be exercised end-to-end without
+  invoking a model.
+- **Navigation assertion:** create panes with known ids, run `jump-next`, assert the active
+  pane id — pure tmux, no model.
+- **Invariant checks (must always hold):** assert the daemon never issues `send-keys` of
+  non-human-authored content (grep the dispatch path / test that no code path synthesizes
+  input), and that the ingest socket binds loopback only.
+
+### Quality gate
+
+A phase is not "done" until its exit-criterion row passes. Phase 6 is not "done" until AS-1
+through AS-6 pass. The marathon must treat these as the **definition of done** — do not mark a
+phase complete on code-read alone; run the scenario and observe it.
+
+---
+
 ## Failure modes & invariants
 
 **Invariants**
