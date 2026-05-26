@@ -1,0 +1,60 @@
+#!/bin/bash
+# Trail Boss CLI — navigation commands for tmux integration
+set -e
+
+DAEMON_URL="${TRAILBOSS_URL:-http://127.0.0.1:4000}"
+
+case "$1" in
+  jump-next)
+    # Query daemon for head-of-queue pane id, then navigate to it
+    PANE_INFO=$(curl -s "$DAEMON_URL/next")
+    PANE_ID=$(echo "$PANE_INFO" | grep -o '"paneId":"[^"]*"' | cut -d'"' -f4)
+
+    if [ -z "$PANE_ID" ] || [ "$PANE_ID" = "null" ]; then
+      REASON=$(echo "$PANE_INFO" | grep -o '"reason":"[^"]*"' | cut -d'"' -f4)
+      echo "Trail Boss: $REASON" >&2
+      exit 1
+    fi
+
+    # Navigate to the pane: switch-client, select-window, select-pane
+    # Pane ids are tmux-server-global, so we can address them directly
+    SESSION_NAME=$(tmux display -p -t "$PANE_ID" '#{session_name}')
+    if [ -z "$SESSION_NAME" ]; then
+      echo "Trail Boss: pane $PANE_ID not found" >&2
+      exit 1
+    fi
+
+    tmux switch-client -t "$SESSION_NAME" \; select-window -t "$PANE_ID" \; select-pane -t "$PANE_ID"
+    ;;
+
+  skip)
+    # Skip current head and move to tail, then jump to new head
+    PANE_INFO=$(curl -s -X POST "$DAEMON_URL/skip")
+    PANE_ID=$(echo "$PANE_INFO" | grep -o '"paneId":"[^"]*"' | cut -d'"' -f4)
+
+    if [ -z "$PANE_ID" ] || [ "$PANE_ID" = "null" ]; then
+      REASON=$(echo "$PANE_INFO" | grep -o '"reason":"[^"]*"' | cut -d'"' -f4)
+      echo "Trail Boss: $REASON" >&2
+      exit 1
+    fi
+
+    SESSION_NAME=$(tmux display -p -t "$PANE_ID" '#{session_name}')
+    if [ -z "$SESSION_NAME" ]; then
+      echo "Trail Boss: pane $PANE_ID not found" >&2
+      exit 1
+    fi
+
+    tmux switch-client -t "$SESSION_NAME" \; select-window -t "$PANE_ID" \; select-pane -t "$PANE_ID"
+    ;;
+
+  popup)
+    # Show the queue picker (Phase 5)
+    echo "Trail Boss: popup not yet implemented" >&2
+    exit 1
+    ;;
+
+  *)
+    echo "Usage: trailboss {jump-next|skip|popup}" >&2
+    exit 1
+    ;;
+esac
