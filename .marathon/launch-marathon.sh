@@ -33,7 +33,7 @@ fi
 MODEL="${ANTHROPIC_MODEL:-glm-4.7}"
 LOG="$LOG_DIR/session_$(date +%Y%m%d_%H%M%S).jsonl"
 
-LOOP_CMD="cd '$REPO_DIR' && unset CLAUDECODE && export CLAUDE_CONFIG_DIR='$CONFIG_DIR' && while true; do
+LOOP_CMD="cd '$REPO_DIR' && unset CLAUDECODE && set -a && source '$ENV_FILE' && set +a && export CLAUDE_CONFIG_DIR='$CONFIG_DIR' && while true; do
   echo \"[trailboss-marathon] iteration start \$(date -Iseconds)\"
   cat '$INSTRUCTION_FILE' | claude --model '$MODEL' --dangerously-skip-permissions --output-format stream-json --verbose --print 2>&1 | tee -a '$LOG'
   ec=\$?
