@@ -95,6 +95,25 @@
 **Next:**
 - Phase 6: Walking Skeleton — end-to-end acceptance scenarios (AS-1 through AS-7)
 
-## Phase 6: Walking Skeleton (PENDING)
+## Phase 6: Walking Skeleton ✅ COMPLETE
+
+**Done:** All 7 acceptance scenarios pass end-to-end.
+
+**Verified:**
+- `test-walking-skeleton.sh` passes all scenarios (AS-1 through AS-7)
+- AS-1: Single permission block — enqueue, navigate, approve, dequeue
+- AS-2: FIFO ordering — session A before B, depletes oldest-first
+- AS-3: Answered-in-pane reconcile — transcript advance dequeues without UI action
+- AS-4: Dropped-event recovery — collector down during Stop, reconcile rebuilds queue
+- AS-5: Skip + cooldown — skip moves to tail, cooldown makes queue empty until expiry
+- AS-6: No forced focus-steal — resolving a session does NOT auto-switch client
+- AS-7: Pane reuse regression — new session in old pane: navigation targets current owner
+
+**Files:**
+- `test-walking-skeleton.sh` — comprehensive acceptance scenario test suite (399 lines)
+- `notes/tb-4mq.md` — phase 6 completion notes
+
+**Next:**
+- Phase 7: Iterate — polish, edge cases, and enhancement loop
 
 ## Phase 7: Iterate (PENDING)
