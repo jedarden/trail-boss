@@ -1,0 +1,54 @@
+#!/bin/bash
+# Bootstrap Trail Boss with all currently-idle Claude Code panes.
+# Scans tmux for panes running `claude`, injects a synthetic Stop event
+# for any not already in the queue. Uses pane_id as session_id.
+# When real hooks fire, the daemon replaces these synthetic entries.
+
+DAEMON_URL="${TRAILBOSS_URL:-http://127.0.0.1:4000}"
+
+if ! curl -s --max-time 1 "$DAEMON_URL/status" >/dev/null 2>&1; then
+  echo "trailboss-bootstrap: daemon not running" >&2
+  exit 1
+fi
+
+# Get current queue pane ids so we skip already-tracked panes
+QUEUED_PANES=$(curl -s "$DAEMON_URL/queue" | python3 -c "
+import json, sys
+d = json.load(sys.stdin)
+for item in d.get('items', []):
+    print(item.get('pane_id', ''))
+" 2>/dev/null)
+
+INJECTED=0
+SKIPPED=0
+
+while IFS=: read -r pane_id pane_pid session_name; do
+  # Skip if already in queue
+  if echo "$QUEUED_PANES" | grep -qF "$pane_id"; then
+    SKIPPED=$((SKIPPED + 1))
+    continue
+  fi
+
+  # Get the working directory of the claude process
+  cwd=$(readlink /proc/$pane_pid/cwd 2>/dev/null || echo "$HOME")
+
+  # Inject synthetic Stop with pane_id as session_id (no transcript_path)
+  curl -s -X POST "$DAEMON_URL/event" \
+    -H "Content-Type: application/json" \
+    -H "X-Tmux-Pane: $pane_id" \
+    -d "{
+      \"session_id\": \"$pane_id\",
+      \"transcript_path\": \"\",
+      \"cwd\": \"$cwd\",
+      \"hook_event_name\": \"Stop\",
+      \"last_assistant_message\": \"(idle at start of trail-boss)\"
+    }" >/dev/null 2>&1 || true
+
+  INJECTED=$((INJECTED + 1))
+done < <(tmux list-panes -a -F '#{pane_id}:#{pane_pid}:#{session_name}' \
+         | while IFS=: read pane_id pane_pid session_name; do
+             cmd=$(tmux display -p -t "$pane_id" '#{pane_current_command}' 2>/dev/null)
+             [ "$cmd" = "claude" ] && echo "$pane_id:$pane_pid:$session_name"
+           done)
+
+echo "trailboss-bootstrap: injected $INJECTED pane(s), skipped $SKIPPED already-queued"
