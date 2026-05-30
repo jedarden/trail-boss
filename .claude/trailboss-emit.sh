@@ -9,8 +9,8 @@ COLLECTOR_URL="${TRAILBOSS_COLLECTOR_URL:-http://localhost:4000/event}"
 PANE_ID="${TMUX_PANE:-}"
 
 if [ -z "$PANE_ID" ]; then
-  echo "trailboss-emit: error: TMUX_PANE not set" >&2
-  exit 1
+  # Not running inside tmux — silently skip (headless/SDK sessions)
+  exit 0
 fi
 
 # Forward stdin (the hook payload) to the collector, injecting the pane id via header

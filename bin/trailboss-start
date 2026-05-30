@@ -1,0 +1,49 @@
+#!/bin/bash
+# Start the Trail Boss daemon and load keybindings into the current tmux session.
+set -e
+
+TB_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)"
+DATA_DIR="${TRAILBOSS_DATA_DIR:-$HOME/.local/share/trailboss}"
+
+# Check we're inside tmux
+if [ -z "$TMUX" ]; then
+  echo "trailboss-start: must be run inside a tmux session" >&2
+  exit 1
+fi
+
+# Kill any existing daemon
+pkill -f "bun.*trail-boss/daemon/index.ts" 2>/dev/null || true
+sleep 0.5
+
+# Start daemon
+mkdir -p "$DATA_DIR"
+cd "$TB_DIR/daemon"
+nohup bun index.ts > "$DATA_DIR/daemon.log" 2>&1 &
+DAEMON_PID=$!
+echo $DAEMON_PID > "$DATA_DIR/daemon.pid"
+
+# Wait for it to be ready
+for i in $(seq 1 10); do
+  if curl -s --max-time 0.5 "http://127.0.0.1:4000/status" >/dev/null 2>&1; then
+    break
+  fi
+  sleep 0.3
+done
+
+if ! curl -s --max-time 1 "http://127.0.0.1:4000/status" >/dev/null 2>&1; then
+  echo "trailboss-start: daemon failed to start (check $DATA_DIR/daemon.log)" >&2
+  exit 1
+fi
+
+# Load keybindings into current tmux session
+tmux source-file "$TB_DIR/tmux.conf"
+
+# Bootstrap: inject synthetic stops for all currently-idle Claude panes
+"$TB_DIR/bin/trailboss-bootstrap"
+
+echo "Trail Boss started (PID $DAEMON_PID)"
+echo "  [1-N] jump to session   [s] skip   [q] quit dashboard"
+echo "  prefix+B — return to this dashboard from any session"
+echo ""
+sleep 1
+exec "$TB_DIR/bin/trailboss-watch"

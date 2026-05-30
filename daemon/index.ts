@@ -2,7 +2,7 @@
 import * as http from "http";
 import type { HookEvent } from "./types.ts";
 import { adaptHookEvent, isStuckEvent, isUnstuckEvent, isSessionRegistered, isSessionEnded } from "./claude-adapter.ts";
-import { upsertSession, deleteSession, enqueue, dequeue, skipHead, getHead, getStuckCount, getAllStuck, cleanupQueue } from "./db.ts";
+import { upsertSession, deleteSession, enqueue, dequeue, dequeueByPaneId, skipHead, getHead, getStuckCount, getAllStuck, cleanupQueue } from "./db.ts";
 import { startReconcileLoop } from "./reconcile.ts";
 
 const PORT = 4000;
@@ -57,7 +57,10 @@ const server = http.createServer(async (req, res) => {
       const event = adaptHookEvent(raw, paneId);
 
       if (isStuckEvent(event)) {
-        // Upsert session with stuck info, then enqueue
+        // Clean up any bootstrap synthetic entry for this pane before registering real session
+        if (event.sessionId !== event.paneId) {
+          dequeueByPaneId(event.paneId, event.sessionId);
+        }
         upsertSession(
           event.sessionId,
           event.paneId,
@@ -70,7 +73,9 @@ const server = http.createServer(async (req, res) => {
         enqueue(event.sessionId, event.reason, event.timestamp);
         console.log(`[event] stuck: ${event.sessionId.slice(0, 8)} (${event.reason})`);
       } else if (isUnstuckEvent(event)) {
+        // Dequeue by session_id; also clean up any bootstrap entry for this pane
         dequeue(event.sessionId);
+        dequeueByPaneId(event.paneId, event.sessionId);
         console.log(`[event] unstuck: ${event.sessionId.slice(0, 8)}`);
       } else if (isSessionRegistered(event)) {
         upsertSession(

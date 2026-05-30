@@ -49,8 +49,9 @@ export function getSession(sessionId: string): { session_id: string; pane_id: st
 }
 
 export function deleteSession(sessionId: string): void {
-  const stmt = db.prepare("DELETE FROM sessions WHERE session_id = ?");
-  stmt.run(sessionId);
+  // Remove queue rows first (FK references sessions.session_id)
+  db.prepare("DELETE FROM queue WHERE session_id = ?").run(sessionId);
+  db.prepare("DELETE FROM sessions WHERE session_id = ?").run(sessionId);
 }
 
 // Queue operations
@@ -81,6 +82,21 @@ export function dequeue(sessionId: string): void {
     UPDATE queue SET dequeued_at = ? WHERE session_id = ? AND dequeued_at IS NULL
   `);
   stmt.run(now, sessionId);
+}
+
+// Dequeue any synthetic bootstrap entry whose session_id equals the pane_id
+// (but skip if it's already the real session). Called when a real hook fires for a pane.
+export function dequeueByPaneId(paneId: string, realSessionId: string): void {
+  const now = Date.now();
+  // Bootstrap entries have session_id = pane_id
+  const stmt = db.prepare(`
+    UPDATE queue SET dequeued_at = ?
+    WHERE session_id = ? AND session_id != ? AND dequeued_at IS NULL
+  `);
+  stmt.run(now, paneId, realSessionId);
+  // Also clean up the synthetic session row itself
+  const del = db.prepare(`DELETE FROM sessions WHERE session_id = ? AND session_id != ?`);
+  del.run(paneId, realSessionId);
 }
 
 export function skipHead(sessionId: string, cooldownMs: number): void {
@@ -146,10 +162,11 @@ export function getAllStuck(limit: number = 50): Array<{
     FROM queue q
     JOIN sessions s ON s.session_id = q.session_id
     WHERE q.dequeued_at IS NULL
+      AND (q.skip_cooldown_until IS NULL OR q.skip_cooldown_until < ?)
     ORDER BY q.stuck_at ASC
     LIMIT ?
   `);
-  return stmt.all(now) as ReturnType<typeof getAllStuck>;
+  return stmt.all(now, limit) as ReturnType<typeof getAllStuck>;
 }
 
 // Reconcile: get all sessions that might be stuck but need verification

@@ -1,0 +1,100 @@
+#!/bin/bash
+# Trail Boss live queue dashboard.
+# Runs in the operator session and continuously shows stuck sessions.
+# Press a number to jump to that session; r to refresh; q to quit.
+
+DAEMON_URL="${TRAILBOSS_URL:-http://127.0.0.1:4000}"
+TB_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)"
+REFRESH=3  # seconds between auto-refresh
+
+jump_to_pane() {
+  local pane_id="$1"
+  local session_name
+  session_name=$(tmux display -p -t "$pane_id" '#{session_name}' 2>/dev/null)
+  if [ -z "$session_name" ]; then
+    return 1
+  fi
+  # Record origin so prefix+B can return here
+  tmux display -p '#{session_name}' > /tmp/trailboss-origin
+  # Switch client away — this process keeps running in the background
+  # and will auto-refresh so the dashboard is current when operator returns
+  tmux switch-client -t "$session_name" \; select-window -t "$pane_id" \; select-pane -t "$pane_id"
+}
+
+render() {
+  local json
+  json=$(curl -s --max-time 1 "$DAEMON_URL/queue" 2>/dev/null)
+  if [ -z "$json" ]; then
+    printf "\033[2J\033[H"
+    echo "  Trail Boss — daemon not reachable"
+    return
+  fi
+
+  local count
+  count=$(echo "$json" | python3 -c "import json,sys; print(json.load(sys.stdin).get('count',0))" 2>/dev/null)
+
+  printf "\033[2J\033[H"  # clear screen, move to top
+
+  if [ "$count" -eq 0 ]; then
+    printf "  Trail Boss — all clear, no stuck sessions\n\n"
+    printf "  (waiting for sessions to stop...)\n"
+    printf "\n  [q] quit\n"
+    return
+  fi
+
+  printf "  Trail Boss — %d stuck session%s\n" "$count" "$([ "$count" -ne 1 ] && echo s)"
+  printf "  %-4s %-10s %-22s %s\n" "NUM" "REASON" "SESSION" "LAST MESSAGE"
+  printf "  %s\n" "$(printf '%.0s─' {1..70})"
+
+  # Build indexed list
+  PANE_MAP=()
+  local idx=1
+  while IFS='|' read -r pane_id reason session_name message; do
+    PANE_MAP[$idx]="$pane_id"
+    printf "  [%2d] %-10s %-22s %s\n" "$idx" "$reason" "$session_name" "${message:0:30}"
+    idx=$((idx + 1))
+  done < <(echo "$json" | python3 -c "
+import json, sys
+d = json.load(sys.stdin)
+for item in d.get('items', []):
+    pane  = item.get('pane_id', '')
+    reason= item.get('reason', 'stopped')
+    sess  = item.get('session_id', '')[:8]
+    msg   = (item.get('last_message') or '').replace('\n',' ')[:30]
+    cwd   = item.get('cwd','').split('/')[-1]
+    label = cwd if cwd else sess
+    print(f'{pane}|{reason}|{label}|{msg}')
+" 2>/dev/null)
+
+  printf "\n  [1-%d] jump to session   [s] skip head   [r] refresh   [q] quit\n" "$((idx-1))"
+}
+
+# Render loop with timeout-based input
+while true; do
+  render
+  # Read with timeout for auto-refresh
+  if read -r -s -n 1 -t "$REFRESH" key 2>/dev/null; then
+    case "$key" in
+      q|Q) echo; break ;;
+      r|R) continue ;;
+      s|S)
+        curl -s -X POST "$DAEMON_URL/skip" >/dev/null 2>&1 || true
+        continue
+        ;;
+      [0-9])
+        # Read possible second digit
+        second=""
+        if read -r -s -n 1 -t 0.3 second 2>/dev/null && [[ "$second" =~ [0-9] ]]; then
+          num="${key}${second}"
+        else
+          num="$key"
+        fi
+        pane_id="${PANE_MAP[$num]}"
+        if [ -n "$pane_id" ]; then
+          jump_to_pane "$pane_id"
+          # Don't exit — keep running in background so dashboard is live on return
+        fi
+        ;;
+    esac
+  fi
+done
