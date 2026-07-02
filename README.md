@@ -133,6 +133,14 @@ Add to your project's `.claude/settings.json`:
     "UserPromptSubmit": [{
       "type": "command",
       "command": "/path/to/trail-boss/.claude/trailboss-emit.sh"
+    }],
+    "SessionStart": [{
+      "type": "command",
+      "command": "/path/to/trail-boss/.claude/trailboss-emit.sh"
+    }],
+    "SessionEnd": [{
+      "type": "command",
+      "command": "/path/to/trail-boss/.claude/trailboss-emit.sh"
     }]
   }
 }
@@ -212,9 +220,11 @@ trail-boss/
 │   ├── trailboss         # CLI: jump-next, skip, popup, return
 │   ├── trailboss-tui     # TUI binary (build from tui/ with Go)
 │   ├── trailboss-start   # Session launcher
+│   ├── trailboss-bootstrap # Initial setup script
 │   ├── trailboss-popup   # Queue picker popup (box-drawing UI)
 │   ├── trailboss-preview # Live pane capture loop
-│   └── trailboss-status  # tmux status segment
+│   ├── trailboss-status  # tmux status segment
+│   └── trailboss-watch   # (deprecated, superseded by TUI)
 ├── docs/
 │   └── plan/plan.md      # Complete design spec
 ├── .claude/

@@ -121,7 +121,7 @@ stuck conditions: a session waiting at a permission prompt is mid-turn and does 
 | Hook | Why it's needed | Status |
 |------|----------------------|--------|
 | `Stop` | Turn finished; session waiting for the next instruction. | Confirmed firing in interactive and `-p` (probe 2026-05-25); payload carries `last_assistant_message` |
-| `PermissionRequest` | Session blocked mid-turn on approval — emits **no** `Stop`, so this is the only signal for the permission case. | Exists; firing/payload **not yet probed** (phase 1) |
+| `PermissionRequest` | Session blocked mid-turn on approval — emits **no** `Stop`, so this is the only signal for the permission case. | **Confirmed firing + payload (probe 2026-05-25)** — includes `tool_name` + `tool_input`; permission block emits `PermissionRequest` and **no** `Stop` |
 | `UserPromptSubmit` | Input submitted → session unstuck → **dequeue**. | Confirmed primitive |
 | `SessionStart` | Register the session; re-assert `session_id → pane`. | Confirmed firing (probe) |
 | `SessionEnd` | Retire the session. | Exists; firing not yet probed |
@@ -373,8 +373,7 @@ driven interactive session in a throwaway tmux pane.
 - **tmux 3.5a** has all required commands; **`claude` 2.1.150** offers `-r/--resume`,
   `-c/--continue`, `--fork-session`, `--session-id`, `--settings`, `--remote-control`.
 
-Still **unverified** (probe before depending on): `PermissionRequest` firing + payload shape
-(esp. how the proposed command is represented and which gate types trigger it).
+**Confirmed (probe 2026-05-25):** `PermissionRequest` fires with `tool_name` + `tool_input` in the payload — exactly what the queue needs to display the proposed operation. Permission block emits `PermissionRequest` and **no** `Stop`.
 
 ---
 
@@ -502,7 +501,7 @@ phase complete on code-read alone; run the scenario and observe it.
 
 ---
 
-## Phase 8: TUI rewrite (planned)
+## Phase 8: TUI rewrite ✅ COMPLETE
 
 The bash-based `trailboss-watch` and `trailboss-popup` scripts work but hit a ceiling: no
 cursor-addressable rendering, no dual-pane layout, no color, no detail panel. The reference
@@ -605,8 +604,8 @@ Auto-detect terminal color support; degrade gracefully (no-color mode for dumb t
 | `G` | Jump to bottom |
 | `ctrl+d` | Page down |
 | `ctrl+u` | Page up |
-| `Enter` or `l` | Jump to highlighted session (switch tmux client) |
-| `Tab` | Jump to queue head (same as `prefix+Tab` tmux binding) |
+| `Enter` | Jump to highlighted session (switch tmux client) |
+| `l` / `Tab` | Focus detail pane |
 | `s` | Skip head + advance |
 | `r` | Force refresh from daemon |
 | `J` / `K` | Scroll detail pane down / up |
@@ -662,8 +661,8 @@ The origin file (`/tmp/trailboss-origin`) is written before every jump so `prefi
    stuck/unstuck event the daemon consumes, so detection stays isolated to a per-harness
    adapter. Is a purely tmux-level detector (no hooks) viable as a universal fallback for future
    harnesses? See "Layering" above.
-2. **`PermissionRequest` specifics** — confirm it fires for the gate types you hit and what its
-   payload carries (the proposed command, for display). Detection coverage depends on it; phase 1.
+2. ~~**`PermissionRequest` specifics** — confirm it fires for the gate types you hit and what its
+   payload carries (the proposed command, for display). Detection coverage depends on it; phase 1.~~ **Resolved (probe 2026-05-25):** confirmed firing with `tool_name` + `tool_input` payload; permission block emits `PermissionRequest` and **no** `Stop`.
 3. **Auto-advance residual** — the trigger, jump model, and keybindings are specified (see
    "Switching & keybindings": Next/Popup/Skip keys, operator-initiated jump, manual tmux nav is
    orthogonal). The only residual is whether to offer an opt-in "auto-jump on resolve" toggle —
@@ -672,11 +671,11 @@ The origin file (`/tmp/trailboss-origin`) is written before every jump so `prefi
    `display-popup` bash scripts to a persistent Go+Bubble Tea window. Key choices finalized:
    `prefix+Tab` (Next), `prefix+S` (Skip), `prefix+g` (popup overlay if kept), `prefix+B`
    (Return). Popup may be retired once the persistent TUI window is the primary surface.
-5. **Popup vs. persistent window** — the current `trailboss-popup` (`display-popup -E`) overlays
+5. ~~**Popup vs. persistent window** — the current `trailboss-popup` (`display-popup -E`) overlays
    a transient picker. The Phase 8 TUI is a persistent window. Decide whether to keep the popup
    as a second surface (useful when already in an agent session) or retire it in favor of
    `prefix+B` → persistent window. Likely keep both: popup for quick in-session triage, window
-   for sustained depletion work.
+   for sustained depletion work.~~ **Resolved:** both retained — `bin/trailboss-popup` for quick in-session triage, persistent TUI window (`trail-boss:dashboard`) for sustained depletion work. `prefix+g` invokes the popup; `prefix+B` returns to the dashboard.
 
 **Resolved this round (recorded so they don't get re-litigated)**
 
