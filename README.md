@@ -80,7 +80,7 @@ Claude Code session (tmux pane)
 | `daemon/` | TypeScript (Bun) | HTTP event ingestion, SQLite state, queue API |
 | `tui/` | Go (Bubble Tea) | Split-panel TUI dashboard |
 | `bin/trailboss` | Shell | CLI: `jump-next`, `skip`, `popup`, `return` |
-| `bin/trailboss-tui` | Go binary | Pre-built TUI binary |
+| `bin/trailboss-tui` | Go binary | TUI binary (build from tui/ with Go) |
 | `bin/trailboss-start` | Shell | Launches daemon + TUI in a `trail-boss` tmux session |
 | `bin/trailboss-preview` | Shell | Live pane capture loop for the split-view preview |
 | `bin/trailboss-status` | Shell | tmux status-bar segment showing stuck count |
@@ -93,7 +93,7 @@ Claude Code session (tmux pane)
 - [Bun](https://bun.sh) — daemon runtime
 - tmux
 - Claude Code with hooks enabled
-- Go 1.24+ — only needed to rebuild the TUI from source (a pre-built binary is in `bin/`)
+- Go 1.24+ — for building the TUI
 
 ---
 
@@ -106,7 +106,16 @@ cd /path/to/trail-boss
 bun install
 ```
 
-### 2. Wire Claude Code hooks
+### 2. Build the TUI
+
+```bash
+cd /path/to/trail-boss/tui
+go build -o ../bin/trailboss-tui .
+```
+
+The `bin/trailboss-start` script will automatically build the TUI if the binary is missing.
+
+### 3. Wire Claude Code hooks
 
 Add to your project's `.claude/settings.json`:
 
@@ -201,7 +210,7 @@ trail-boss/
 │   └── theme.go          # Dracula palette + dumb-terminal fallback
 ├── bin/
 │   ├── trailboss         # CLI: jump-next, skip, popup, return
-│   ├── trailboss-tui     # Pre-built TUI binary (Go 1.24)
+│   ├── trailboss-tui     # TUI binary (build from tui/ with Go)
 │   ├── trailboss-start   # Session launcher
 │   ├── trailboss-popup   # Queue picker popup (box-drawing UI)
 │   ├── trailboss-preview # Live pane capture loop
