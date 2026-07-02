@@ -1,0 +1,54 @@
+{
+  "runs": [
+    {
+      "run": 1,
+      "result": "fail",
+      "duration_seconds": 55,
+      "exit_code": 0,
+      "false_positive": false,
+      "false_negative": false,
+      "failure_type": "unstuck_timeout",
+      "log_file": "run-1.log"
+    },
+    {
+      "run": 2,
+      "result": "fail",
+      "duration_seconds": 56,
+      "exit_code": 0,
+      "false_positive": false,
+      "false_negative": false,
+      "failure_type": "unstuck_timeout",
+      "log_file": "run-2.log"
+    },
+    {
+      "run": 3,
+      "result": "fail",
+      "duration_seconds": 56,
+      "exit_code": 0,
+      "false_positive": false,
+      "false_negative": false,
+      "failure_type": "unstuck_timeout",
+      "log_file": "run-3.log"
+    },
+    {
+      "run": 4,
+      "result": "fail",
+      "duration_seconds": 55,
+      "exit_code": 0,
+      "false_positive": false,
+      "false_negative": false,
+      "failure_type": "unstuck_timeout",
+      "log_file": "run-4.log"
+    },
+    {
+      "run": 5,
+      "result": "fail",
+      "duration_seconds": 54,
+      "exit_code": 0,
+      "false_positive": false,
+      "false_negative": false,
+      "failure_type": "unstuck_timeout",
+      "log_file": "run-5.log"
+    }
+  ]
+}
