@@ -44,9 +44,24 @@ sleep 1
 echo "[setup] Starting daemon..."
 mkdir -p "$DATA_DIR"
 cd "$TB_DIR/daemon"
+export TRAILBOSS_DATA_DIR="$DATA_DIR"
 bun index.ts > /tmp/trailboss-daemon-test.log 2>&1 &
 DAEMON_PID=$!
 sleep 2
+
+# Clear any pre-existing queue entries to ensure test isolation
+echo "[setup] Clearing pre-existing queue entries..."
+while true; do
+  QUEUE_CHECK=$(curl -s "$DAEMON_URL/queue")
+  COUNT=$(echo "$QUEUE_CHECK" | grep -o '"count":[0-9]*' | grep -o '[0-9]*' || echo "0")
+  if [ "$COUNT" -eq 0 ]; then
+    echo "[setup] Queue is clean"
+    break
+  fi
+  echo "[setup] Skipping pre-existing queue entry..."
+  curl -s -X POST "$DAEMON_URL/skip" >/dev/null
+  sleep 0.5
+done
 
 # Verify daemon started
 if ! curl -s --max-time 1 "$DAEMON_URL/status" >/dev/null 2>&1; then
@@ -85,6 +100,7 @@ echo "[setup] Pane title verified: '$PANE_TITLE'"
 # Start the tmux detector in background
 echo "[setup] Starting tmux detector (auto-discovery mode)..."
 cd "$TB_DIR"
+export TMUX="$TMUX"  # Pass custom socket to detector
 bun run daemon/tmux-detector.ts > /tmp/trailboss-detector-test.log 2>&1 &
 DETECTOR_PID=$!
 sleep 2
@@ -121,8 +137,13 @@ while [ $WAIT_TIME -lt $MAX_WAIT ]; do
   COUNT=$(echo "$RESPONSE" | grep -o '"count":[0-9]*' | grep -o '[0-9]*' || echo "0")
 
   if [ "$COUNT" -gt 0 ]; then
-    echo "[test] Pane detected as stuck after ${WAIT_TIME}s"
-    break
+    # Check if this is OUR test pane by looking for the pane_id in the queue
+    if echo "$RESPONSE" | grep -q "\"pane_id\":\"$PANE_ID\""; then
+      echo "[test] Pane detected as stuck after ${WAIT_TIME}s"
+      break
+    else
+      echo "[debug] Queue has $COUNT entries but none match test pane $PANE_ID"
+    fi
   fi
 
   sleep 1
@@ -153,6 +174,14 @@ echo "[test] Session ID format is correct (tmux-*)"
 SESSION_ID=$(echo "$QUEUE_RESPONSE" | grep -o '"session_id":"tmux-[^"]*"' | head -1 | cut -d'"' -f4)
 echo "[test] Session ID: $SESSION_ID"
 
+# Verify the pane_id matches our test pane
+QUEUE_PANE_ID=$(echo "$QUEUE_RESPONSE" | grep -o '"pane_id":"[^"]*"' | head -1 | cut -d'"' -f4)
+if [ "$QUEUE_PANE_ID" != "$PANE_ID" ]; then
+  echo "[fail] Queue pane_id ($QUEUE_PANE_ID) doesn't match test pane ($PANE_ID)"
+  exit 1
+fi
+echo "[test] Pane ID matches: $PANE_ID"
+
 # Check that the reason is "stopped"
 if ! echo "$QUEUE_RESPONSE" | grep -q '"reason":"stopped"'; then
   echo "[fail] Queue entry does not have reason=stopped"
@@ -161,13 +190,13 @@ if ! echo "$QUEUE_RESPONSE" | grep -q '"reason":"stopped"'; then
 fi
 echo "[test] Reason is correct: stopped"
 
-# Check that message exists (should be the prompt line)
-if ! echo "$QUEUE_RESPONSE" | grep -q '"message"'; then
-  echo "[fail] Queue entry does not have message field"
+# Check that last_message exists (should be the prompt line)
+if ! echo "$QUEUE_RESPONSE" | grep -q '"last_message"'; then
+  echo "[fail] Queue entry does not have last_message field"
   echo "[debug] Queue: $QUEUE_RESPONSE"
   exit 1
 fi
-echo "[test] Message field present"
+echo "[test] last_message field present"
 
 # Now simulate activity by sending keys to the pane
 echo "[test] Simulating activity in pane to trigger unstuck..."
