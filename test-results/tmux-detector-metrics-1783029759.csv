@@ -1,0 +1,6 @@
+run,result,duration_seconds,exit_code,detection_time_s,false_positive,false_negative,failure_type,log_file
+1,fail,35,1,21,false,false,pane_id_mismatch,run-1.log
+2,fail,34,1,21,false,false,pane_id_mismatch,run-2.log
+3,fail,35,1,22,false,false,pane_id_mismatch,run-3.log
+4,fail,35,1,21,false,false,pane_id_mismatch,run-4.log
+5,fail,35,1,22,false,false,pane_id_mismatch,run-5.log
