@@ -3,11 +3,20 @@ import * as http from "http";
 import type { HookEvent } from "./types.ts";
 import { adaptHookEvent, isStuckEvent, isUnstuckEvent, isSessionRegistered, isSessionEnded } from "./claude-adapter.ts";
 import { upsertSession, deleteSession, enqueue, dequeue, dequeueByPaneId, skipHead, getHead, getStuckCount, getAllStuck, cleanupQueue } from "./db.ts";
-import { startReconcileLoop } from "./reconcile.ts";
+import { startReconcileLoop, reconcileStuckDirection } from "./reconcile.ts";
 
 const PORT = 4000;
 const HOST = "127.0.0.1"; // Loopback only
 const SKIP_COOLDOWN_MS = 30_000; // 30 seconds
+
+// Run stuck-direction reconcile on startup to recover sessions that became stuck while daemon was down
+console.log("[startup] running stuck-direction reconcile...");
+const stuckResult = reconcileStuckDirection();
+if (stuckResult.enqueued > 0) {
+  console.log(`[startup] enqueued ${stuckResult.enqueued}/${stuckResult.checked} sessions from transcripts`);
+} else {
+  console.log(`[startup] no stuck sessions recovered from transcripts (${stuckResult.checked} checked)`);
+}
 
 // Start reconcile loop (runs every 5s by default)
 startReconcileLoop(5000);
