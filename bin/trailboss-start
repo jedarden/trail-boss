@@ -1,9 +1,8 @@
 #!/bin/bash
-# Start the Trail Boss daemon and load keybindings into the current tmux session.
+# Start the Trail Boss daemon and open the supervisor split-view dashboard.
 set -e
 
 TB_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)"
-DATA_DIR="${TRAILBOSS_DATA_DIR:-$HOME/.local/share/trailboss}"
 
 # Check we're inside tmux
 if [ -z "$TMUX" ]; then
@@ -11,19 +10,18 @@ if [ -z "$TMUX" ]; then
   exit 1
 fi
 
-# Kill any existing daemon
+# Kill any existing trail-boss session and daemon process, then start fresh.
+# Killing the daemon window when it's the session's last window auto-destroys
+# the session, so it's simpler to tear down the whole session at once.
 pkill -f "bun.*trail-boss/daemon/index.ts" 2>/dev/null || true
+tmux kill-session -t trail-boss 2>/dev/null || true
 sleep 0.5
 
-# Start daemon
-mkdir -p "$DATA_DIR"
-cd "$TB_DIR/daemon"
-nohup bun index.ts > "$DATA_DIR/daemon.log" 2>&1 &
-DAEMON_PID=$!
-echo $DAEMON_PID > "$DATA_DIR/daemon.pid"
+# Create a fresh session with the daemon as its first (and only) window
+tmux new-session -d -s trail-boss -n daemon -c "$TB_DIR/daemon" "bun index.ts"
 
-# Wait for it to be ready
-for i in $(seq 1 10); do
+# Wait for daemon to be ready
+for i in $(seq 1 15); do
   if curl -s --max-time 0.5 "http://127.0.0.1:4000/status" >/dev/null 2>&1; then
     break
   fi
@@ -31,19 +29,39 @@ for i in $(seq 1 10); do
 done
 
 if ! curl -s --max-time 1 "http://127.0.0.1:4000/status" >/dev/null 2>&1; then
-  echo "trailboss-start: daemon failed to start (check $DATA_DIR/daemon.log)" >&2
+  echo "trailboss-start: daemon failed to start" >&2
+  tmux select-window -t trail-boss:daemon 2>/dev/null || true
   exit 1
 fi
 
-# Load keybindings into current tmux session
+# Load keybindings
 tmux source-file "$TB_DIR/tmux.conf"
 
 # Bootstrap: inject synthetic stops for all currently-idle Claude panes
 "$TB_DIR/bin/trailboss-bootstrap"
 
-echo "Trail Boss started (PID $DAEMON_PID)"
-echo "  [1-N] jump to session   [s] skip   [q] quit dashboard"
-echo "  prefix+B — return to this dashboard from any session"
-echo ""
-sleep 1
-exec "$TB_DIR/bin/trailboss-watch"
+# Create dashboard window as a bare shell.
+# Use the stable window ID (@NNN) for all subsequent targeting so auto-rename
+# can't break references before we lock the name.
+DASH_ID=$(tmux new-window -t trail-boss -d -c "$TB_DIR" -P -F "#{window_id}")
+
+# Pin the window name before any process renames it
+tmux set-window-option -t "trail-boss:$DASH_ID" automatic-rename off
+tmux rename-window -t "trail-boss:$DASH_ID" dashboard
+
+# Resolve the top pane's stable %ID (immune to pane-base-index setting)
+TOP_PANE=$(tmux display-message -t "trail-boss:$DASH_ID" -p "#{pane_id}")
+
+# Create the bottom preview pane — pass the command directly so there's no
+# send-keys timing race waiting for a shell to become ready.
+tmux split-window -t "$TOP_PANE" -v -p 40 -d -c "$TB_DIR" \
+  "$TB_DIR/bin/trailboss-preview"
+
+# Start the TUI in the top pane (exec replaces the shell)
+tmux send-keys -t "$TOP_PANE" "exec $TB_DIR/bin/trailboss-tui" Enter
+
+# Focus top (TUI) pane
+tmux select-pane -t "$TOP_PANE"
+
+# Switch the current client to the TUI
+tmux switch-client -t "$TOP_PANE"

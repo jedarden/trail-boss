@@ -57,13 +57,8 @@ case "$1" in
     ;;
 
   return)
-    # Switch back to the operator session recorded before the last jump
-    ORIGIN=$(cat /tmp/trailboss-origin 2>/dev/null)
-    if [ -z "$ORIGIN" ]; then
-      echo "Trail Boss: no origin session recorded" >&2
-      exit 1
-    fi
-    tmux switch-client -t "$ORIGIN"
+    # Always return to the Trail Boss dashboard window (TUI pane is active)
+    tmux switch-client -t trail-boss:dashboard
     ;;
 
   *)
