@@ -12,7 +12,7 @@ A tmux-based fleet supervision tool — a "dead-letter queue for AI coding agent
 ## Tech Stack
 
 - **Daemon**: Bun (TypeScript), SQLite via `bun:sqlite`
-- **TUI (Phase 8)**: Go 1.22+, `charmbracelet/bubbletea`, `charmbracelet/bubbles`, `charmbracelet/lipgloss`
+- **TUI (Phase 8)**: Go 1.24+, `charmbracelet/bubbletea`, `charmbracelet/bubbles`, `charmbracelet/lipgloss`
 - **Bead prefix**: `tb`
 
 ## Closing Beads
