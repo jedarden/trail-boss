@@ -1,0 +1,6 @@
+run_number,status,exit_code,duration_seconds,notes
+1,FAIL,1,35,"Bug: pane ID mismatch - queue has %22, test pane is %0"
+2,FAIL,1,34,"Bug: pane ID mismatch - queue has %22, test pane is %0"
+3,FAIL,1,34,"Bug: pane ID mismatch - queue has %22, test pane is %0"
+4,FAIL,1,35,"Bug: pane ID mismatch - queue has %22, test pane is %0"
+5,FAIL,1,34,"Bug: pane ID mismatch - queue has %22, test pane is %0"
