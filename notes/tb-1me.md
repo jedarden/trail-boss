@@ -1,21 +1,129 @@
 # Tmux Detector Acceptance Test Results - tb-1me
 
-## Test Execution Summary
+## Test Execution Summary (Latest Run)
 
-**Date:** 2026-07-02  
-**Test Script:** test-tmux-detector.sh  
-**Iterations:** 5 runs  
+**Date:** 2026-07-02 17:30
+**Test Script:** test-tmux-detector.sh
+**Test Runner:** run-acceptance-test.sh
+**Iterations:** 5 runs
 **Results:** 0/5 PASS (100% failure rate)
+**Results File:** test-results/tb-1me-results-20260702-173028.csv
 
 ## Detailed Results
 
 | Run | Status | Exit Code | Duration | Notes |
 |-----|--------|-----------|----------|-------|
-| 1 | FAIL | 1 | 54s | False negative: session not unstuck after activity |
-| 2 | FAIL | 1 | 54s | False negative: session not unstuck after activity |
-| 3 | FAIL | 1 | 54s | False negative: session not unstuck after activity |
-| 4 | FAIL | 1 | 55s | False negative: session not unstuck after activity |
-| 5 | FAIL | 1 | 54s | False negative: session not unstuck after activity |
+| 1 | FAIL | 1 | 52s | False negative: pane not detected as stuck |
+| 2 | FAIL | 1 | 53s | False negative: pane not detected as stuck |
+| 3 | FAIL | 1 | 53s | False negative: pane not detected as stuck |
+| 4 | FAIL | 1 | 52s | False negative: pane not detected as stuck |
+| 5 | FAIL | 1 | 53s | False negative: pane not detected as stuck |
+
+**Average duration:** 52.6 seconds
+**Consistency:** 100% (all 5 runs failed identically)
+
+---
+
+## Previous Test Run (Earlier Today)
+
+**Date:** 2026-07-02 ~15:08
+**Results:** 0/5 PASS (100% failure rate)
+**Issue:** Queue clearing bug (different root cause)
+**Notes:** See earlier content below for details on that run
+
+---
+
+## Root Cause Analysis (Current Run)
+
+### Test Infrastructure Bug
+
+All test runs failed due to a **test environment misconfiguration**, not a detector viability issue.
+
+#### The Bug
+
+The test script creates an isolated tmux server with a custom socket:
+```bash
+TMUX_TEST_SOCK="/tmp/tmux-trailboss-tmux-test-$$"
+TMUX="tmux -S $TMUX_TEST_SOCK"
+```
+
+And incorrectly passes this to the detector:
+```bash
+export TMUX="$TMUX"  # Line 103 - WRONG VARIABLE
+```
+
+However, the detector code (`daemon/tmux-detector.ts`) expects a different environment variable:
+```typescript
+const TMUX_SOCKET = process.env.TRAILBOSS_TMUX_SOCKET || "";
+```
+
+#### Evidence from Logs
+
+The detector log shows repeated failures to list panes:
+```
+[tmux] Failed to list panes: Error: Command failed: tmux list-panes -a -F '#{pane_id} #{pane_title}'
+```
+
+This error occurs because:
+1. Detector tries to use the default tmux server (no socket flag)
+2. Test panes exist only on the isolated server with custom socket
+3. Detector never sees the test panes
+
+#### Test Output Confirms
+
+The test output shows:
+- Detector started successfully
+- Test pane created with title `@tb-test` verified
+- Detector log shows "Failed to list panes" repeatedly
+- Queue contains entries from production (different pane_ids like %22, %18)
+- Test pane %0 never appears in queue
+
+### Impact on Test Validity
+
+This test failure **does NOT indicate a detector problem**. As documented in `notes/tb-23i.md`:
+- The detector has been manually verified to work correctly in production
+- The issue is purely test infrastructure
+- Detector uses standard tmux commands, but needs `TRAILBOSS_TMUX_SOCKET` for custom sockets
+
+### What Was NOT Measured
+
+Due to the infrastructure bug, these metrics could not be assessed:
+- **False positive rate:** Not measured (detector never saw test panes)
+- **False negative rate:** Not measured (detector never saw test panes)
+- **Detection latency:** Not measured (detector never registered panes)
+- **Unstuck detection:** Not measured (detector never registered panes)
+
+## Performance Metrics
+
+- **Average execution time:** 52.6 seconds
+- **Test timeout:** 40 seconds (max wait for stuck detection)
+- **Setup time:** ~10-15 seconds (daemon start, tmux server start, pane creation)
+- **Consistency:** 100% - all 5 runs failed identically with same duration
+
+## Required Fix
+
+**File:** `test-tmux-detector.sh`, line 103
+
+```bash
+# BEFORE (incorrect):
+export TMUX="$TMUX"  # Detector doesn't read this variable
+
+# AFTER (correct):
+export TRAILBOSS_TMUX_SOCKET="$TMUX_TEST_SOCK"  # Detector reads this variable
+```
+
+## Recommendations
+
+1. **Fix test infrastructure** (1-line change above)
+2. **Re-run acceptance test** after fix to gather actual metrics
+3. **Add pre-test validation** that detector can list panes before main test logic
+4. **Consider alternative:** Modify detector to respect standard `TMUX` environment variable
+
+---
+
+## Previous Test Run Analysis (Historical Reference)
+
+*This section documents findings from the earlier test run which had a different issue.*
 
 ## Root Cause Analysis
 
