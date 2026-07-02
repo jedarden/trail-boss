@@ -188,6 +188,8 @@ The adapter seam is validated: the daemon consumes normalized events from either
 
 ## Test Results (2026-07-02)
 
+**Source:** Bead `tb-1me` — Tmux Detector Acceptance Test
+
 ### Test Methodology
 
 **Acceptance Test**: Phase 7 Tmux Detector Acceptance Test (`test-tmux-detector.sh`)
