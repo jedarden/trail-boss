@@ -1,0 +1,60 @@
+=== Phase 7 Tmux Detector Acceptance Test ===
+Acceptance Scenario: harness-agnostic auto-discovery detector
+Testing: pane with @tb- prefix goes quiet -> appears in queue -> input dequeues
+
+[cleanup] tearing down test environment...
+[setup] Starting daemon...
+[setup] Clearing pre-existing queue entries...
+[setup] Skipping pre-existing queue entry...
+[setup] Skipping pre-existing queue entry...
+[setup] Queue is clean
+[setup] daemon running (PID 3593790)
+[setup] Starting isolated tmux server...
+[setup] Creating test pane...
+[setup] Created pane %0
+[setup] Pane title verified: '@tb-test'
+[setup] Starting tmux detector (auto-discovery mode)...
+[setup] detector running (PID 3594335)
+[test] Checking that pane was registered...
+[test] Waiting for detector to detect pane as stuck...
+[test] (quiet threshold is 30000ms, poll interval is 2000ms)
+[debug] Queue has 1 entries but none match test pane %0
+[debug] Queue has 2 entries but none match test pane %0
+[debug] Queue has 2 entries but none match test pane %0
+[debug] Queue has 2 entries but none match test pane %0
+[debug] Queue has 2 entries but none match test pane %0
+[debug] Queue has 2 entries but none match test pane %0
+[test] Pane detected as stuck after 27s
+[test] Verifying queue entry...
+[test] Session ID format is correct (tmux-*)
+[test] Session ID: tmux-%0-1783026205295
+[test] Pane ID matches: %0
+[test] Reason is correct: stopped
+[test] last_message field present
+[test] Simulating activity in pane to trigger unstuck...
+[test] Waiting for detector to unstuck session...
+[fail] Session was not unstuck within 15s
+[info] Queue response: {"items":[{"id":2,"session_id":"c4960b03-9c77-4454-9a00-0e778026c7ef","pane_id":"%22","cwd":"/home/coding/mta-my-way","reason":"stopped","last_message":"## All fixed. Final state:\n\n1. **Missing hook installed on lab** — copied `verify-changes.sh` from ex44 to `/home/coding/.needle/hooks/` on lab (the directory was completely empty there), verified byte-identical. Spaxel's future bead closes will no longer get wrongly bounced back to open.\n\n2. **`bf-3bv`** — resolved itself naturally once the endpoint fix landed; the domain-check worker has already moved on to new beads (`bf-4ya`). No action needed.\n\n3. **`bf-49fp`** — closed directly (via `br batch`, not `br close` — that's broken repo-wide per your earlier feedback). It was caught actively re-looping in the close→reopen cycle at the moment I checked, so I closed it outside NEEDLE's dispatch pipeline entirely, which sidesteps the hook bug. Reason logged: the fix was already committed weeks ago.\n\n4. **`mta-my-way-rq9`** — closed the same way. Turned out to be a pure rollup placeholder: every one of its ~40 mitosis-tree descendants was already closed, and the parallel `s23.8.x` tree covering the same scope was too — the bead itself was just never marked done despite 100% of its children finishing. One thing worth knowing: since the underlying work is fully done, the newer `bf-4xsp`/`640j`/`5dtn`/`5upf` beads from the plan-gap review may themselves now be redundant — I haven't checked that, just flagging it.\n\nBoth adapter fixes verified clean fleet-wide (no remaining dead-endpoint references on either machine). Everything's saved to memory for next time.","stuck_at":1783026199212,"skip_cooldown_until":1783026229212},{"id":34,"session_id":"e558b397-88cd-4306-bde4-61b2ef537d71","pane_id":"%18","cwd":"/home/coding/aide-de-camp","reason":"stopped","last_message":"Great! The **iad-ci** cluster has active credentials and many pods available. Here are some notable pods that might be candidates for deletion:\n\n**Pods with issues (potential cleanup candidates):**\n- `acb-build-77db5-run-tests-3105661157` (Error status, 36m old)\n- `miroir-release-v0.1.0-debug-rs7hv-release-ready-1803881928` (Completed, 14m old)\n\n**Other running pods** (various sensors and workflows)\n\n**To proceed with the deletion, please specify:**\n\n1. **Which pod do you want to delete?** Provide the pod name from the list above, or:\n   - A specific pod name you have in mind\n   - A selector (e.g., `kubectl delete pod -l <label>`)\n   - All pods in a namespace (e.g., `kubectl delete pod -n argo-workflows --all`)\n\n2. **Which cluster?** Currently using `iad-ci` (working credentials). If you need a different cluster, let me know.\n\n3. **Which namespace?** Most pods above are in `argo-workflows` or `argo-events`.\n\n**Example responses:**\n- \"Delete the acb-build-77db5-run-tests pod\"\n- \"Delete all completed pods in argo-workflows namespace\"\n- \"Delete pods with label app=miroir-release\"\n\nPlease provide the specific pod name or deletion criteria, and I'll execute the `kubectl delete pod` command.","stuck_at":1783026199729,"skip_cooldown_until":1783026229729}],"count":2}
+[info] Detector log:
+[2026-07-02T21:03:35.358Z] [detector] poll: 1 panes tracked, 0 stuck
+[2026-07-02T21:03:37.367Z] [detector] poll: 1 panes tracked, 0 stuck
+[2026-07-02T21:03:39.378Z] [detector] poll: 1 panes tracked, 0 stuck
+[2026-07-02T21:03:41.389Z] [detector] poll: 1 panes tracked, 0 stuck
+[2026-07-02T21:03:43.400Z] [detector] poll: 1 panes tracked, 0 stuck
+[2026-07-02T21:03:45.411Z] [detector] poll: 1 panes tracked, 0 stuck
+[2026-07-02T21:03:47.422Z] [detector] poll: 1 panes tracked, 0 stuck
+[2026-07-02T21:03:49.430Z] [detector] poll: 1 panes tracked, 0 stuck
+[2026-07-02T21:03:51.441Z] [detector] poll: 1 panes tracked, 0 stuck
+[2026-07-02T21:03:53.451Z] [detector] poll: 1 panes tracked, 0 stuck
+[2026-07-02T21:03:55.461Z] [detector] stuck: tmux-%0-1783026205295 (quiet for 30157ms, last line: "bash-5.2$")
+[2026-07-02T21:03:55.461Z] [detector] poll: 1 panes tracked, 1 stuck
+[2026-07-02T21:03:57.471Z] [detector] unstuck: tmux-%0-1783026205295 (output changed)
+[2026-07-02T21:03:57.471Z] [detector] poll: 1 panes tracked, 0 stuck
+[2026-07-02T21:03:59.482Z] [detector] poll: 1 panes tracked, 0 stuck
+[2026-07-02T21:04:01.493Z] [detector] poll: 1 panes tracked, 0 stuck
+[2026-07-02T21:04:03.504Z] [detector] poll: 1 panes tracked, 0 stuck
+[2026-07-02T21:04:05.515Z] [detector] poll: 1 panes tracked, 0 stuck
+[2026-07-02T21:04:07.526Z] [detector] poll: 1 panes tracked, 0 stuck
+[2026-07-02T21:04:09.537Z] [detector] poll: 1 panes tracked, 0 stuck
+[cleanup] tearing down test environment...
+[cleanup] exited with error code 1
