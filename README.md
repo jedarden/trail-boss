@@ -73,11 +73,70 @@ Claude Code session (tmux pane)
 
 ---
 
+## Detection methods
+
+Trail Boss supports two detection methods:
+
+### 1. Hook-based detection (primary)
+
+Claude Code fires `Stop` and `PermissionRequest` hooks whenever a session blocks. The emitter script (`trailboss-emit.sh`) POSTs each event to the daemon with the current `$TMUX_PANE` ID. This provides:
+
+- **Immediate detection**: Event-driven, no polling delay
+- **Full fidelity**: Includes session_id, transcript path, cwd, reason (permission vs stopped)
+- **Zero configuration**: Automatic for all Claude Code sessions with hooks enabled
+
+### 2. Tmux detector (fallback)
+
+For coding harnesses without hook support, Trail Boss includes a **tmux-level detector** (`daemon/tmux-detector.ts`) that polls opted-in panes for stuck state. This provides:
+
+- **Harness-agnostic**: Works with any coding tool that runs in a tmux pane
+- **Low false positives**: 30-second quiet threshold + prompt pattern matching
+- **Opt-in required**: Panes must include `@tb-` prefix in their title
+
+**Enabling the tmux detector:**
+
+```bash
+# Method 1: Manual opt-in per pane
+tmux rename-window '@tb-my-work'
+tmux select-pane -T '@tb-task-name'
+
+# Method 2: Run detector standalone
+cd /home/coding/trail-boss
+bun run daemon/tmux-detector.ts
+
+# Method 3: Integrate with trailboss-start (automatic startup)
+# Edit bin/trailboss-start to add detector startup after daemon
+```
+
+**Configuration:**
+
+| Parameter | Environment Variable | Default |
+|-----------|---------------------|---------|
+| Poll interval | `TRAILBOSS_POLL_INTERVAL_MS` | 2000ms (2s) |
+| Quiet threshold | `TRAILBOSS_QUIET_THRESHOLD_MS` | 30000ms (30s) |
+| Opt-in prefix | `TRAILBOSS_OPT_IN_PREFIX` | `@tb-` |
+| Daemon URL | `TRAILBOSS_DAEMON_URL` | `http://127.0.0.1:4000/event/normalized` |
+| Tmux socket | `TMUX` | `tmux` |
+
+**Operational considerations:**
+
+- **No transcript path**: Synthetic sessions (`tmux-%446-timestamp`) have no `transcript.jsonl` for reconcile
+- **No permission vs stopped distinction**: Always emits `reason: "stopped"`
+- **Opt-in compliance**: Users must remember the `@tb-` prefix
+- **Detection latency**: ~30s quiet threshold vs immediate hook-based detection
+- **Multi-server discovery**: Detector polls all tmux servers on the system (correct behavior for production use)
+- **Graceful shutdown**: SIGINT/SIGTERM emit `ended` events for all tracked panes
+
+For Claude Code sessions, hook-based detection is primary (full fidelity, zero latency). The tmux detector enables Trail Boss to work with any future coding harness that lacks hooks. See `docs/notes/decisions.md` for full viability analysis and test results.
+
+---
+
 ## Components
 
 | Component | Language | Purpose |
 |-----------|----------|---------|
 | `daemon/` | TypeScript (Bun) | HTTP event ingestion, SQLite state, queue API |
+| `daemon/tmux-detector.ts` | TypeScript (Bun) | Harness-agnostic fallback detector via pane polling |
 | `tui/` | Go (Bubble Tea) | Split-panel TUI dashboard |
 | `bin/trailboss` | Shell | CLI: `jump-next`, `skip`, `popup`, `return` |
 | `bin/trailboss-tui` | Go binary | TUI binary (build from tui/ with Go) |
@@ -92,7 +151,7 @@ Claude Code session (tmux pane)
 
 - [Bun](https://bun.sh) — daemon runtime
 - tmux
-- Claude Code with hooks enabled
+- Claude Code with hooks enabled (for primary detection)
 - Go 1.24+ — for building the TUI
 
 ---
@@ -210,7 +269,8 @@ trail-boss/
 │   ├── db.ts             # SQLite state layer
 │   ├── reconcile.ts      # Transcript-advance reconcile loop
 │   ├── schema.sql        # Database schema
-│   └── types.ts          # Shared types
+│   ├── types.ts          # Shared types
+│   └── tmux-detector.ts  # Harness-agnostic fallback detector
 ├── tui/
 │   ├── main.go           # Entry point (AltScreen + mouse)
 │   ├── model.go          # Bubble Tea model + split layout
@@ -236,10 +296,11 @@ trail-boss/
 
 ## Status
 
-Phases 1–9 complete. All 7 acceptance scenarios pass end-to-end.
+Phases 1–9 complete. All 7 acceptance scenarios pass end-to-end. Tmux detector fallback implemented and tested.
 
 **What works:**
 - Hook detection: `Stop` and `PermissionRequest` enqueue; `UserPromptSubmit` dequeues
+- Tmux detector fallback: harness-agnostic stuck detection via pane polling (opt-in via `@tb-` prefix)
 - FIFO ordering with skip cooldown (30 s before a skipped session re-surfaces)
 - Reconcile loop: sessions dequeue automatically when transcripts advance (even if
   `UserPromptSubmit` was missed because the daemon was temporarily down)
