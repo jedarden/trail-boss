@@ -1,13 +1,24 @@
 // Transcript reconcile loop: the transcript JSONL is ground truth
 import * as fs from "fs";
-import type { TranscriptEntry } from "./types.ts";
 import { getSession, dequeue, getSessionsForReconcile, upsertSession } from "./db.ts";
 
-export interface TranscriptEntry {
+// Real Claude Code transcript entry shape
+interface TranscriptEntry {
   type: string;
-  role?: string;
-  content?: string;
-  timestamp?: number;
+  message?: {
+    role?: string;
+    content?: unknown;
+  };
+  timestamp?: string | number; // ISO-8601 string or epoch-ms number
+  // Non-message types: attachment, queue-operation, last-prompt, etc.
+}
+
+// Parse timestamp from ISO string or pass through number
+function parseTimestamp(ts: string | number | undefined): number {
+  if (ts === undefined) return 0;
+  if (typeof ts === "number") return ts;
+  const parsed = Date.parse(ts);
+  return isNaN(parsed) ? 0 : parsed;
 }
 
 // Check if a transcript has advanced past the last stuck point
@@ -29,18 +40,20 @@ export function hasTranscriptAdvanced(
   for (let i = lines.length - checkCount; i < lines.length; i++) {
     try {
       const entry: TranscriptEntry = JSON.parse(lines[i]);
-      const entryTime = entry.timestamp ?? 0;
+      const entryTime = parseTimestamp(entry.timestamp);
 
-      // Only consider entries after the stuck time
+      // Only consider entries strictly newer than the stuck time
       if (entryTime <= lastStuckAt) continue;
 
       // User message means they answered directly in the pane
-      if (entry.type === "user_message" || entry.role === "user") {
+      // Real format: type="user" with message.role="user"
+      if (entry.type === "user" || entry.message?.role === "user") {
         return true;
       }
 
       // New assistant turn means the session progressed
-      if (entry.type === "assistant" || entry.role === "assistant") {
+      // Real format: type="assistant" with message.role="assistant"
+      if (entry.type === "assistant" || entry.message?.role === "assistant") {
         return true;
       }
     } catch {

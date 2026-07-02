@@ -57,11 +57,13 @@ create_session() {
   echo "$pane_id"
 }
 
-# Helper: create a transcript file
+# Helper: create a transcript file with real Claude Code format
 create_transcript() {
   local session_id=$1
   local transcript_path="$TB_DIR/test-transcript-${session_id}.jsonl"
-  echo '{"type":"user","content":"test"}' > "$transcript_path"
+  # Real format: type="user" with nested message.role and ISO timestamp
+  local current_iso=$(date -Iseconds)
+  echo "{\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":\"test\"},\"timestamp\":\"$current_iso\"}" > "$transcript_path"
   echo "$transcript_path"
 }
 
@@ -240,9 +242,9 @@ else
 fi
 
 # Simulate user answering directly in pane by advancing transcript
-# Timestamp must exceed last_stuck_at (epoch ms); role must be "user"
-FUTURE_TS=$(( $(date +%s%3N) + 60000 ))
-echo "{\"type\":\"user\",\"role\":\"user\",\"content\":\"answered directly\",\"timestamp\":$FUTURE_TS}" >> "$TRANSIENT3"
+# Use real Claude Code format: type="user" with nested message.role and ISO timestamp
+FUTURE_ISO=$(date -d "+60 seconds" -Iseconds)
+echo "{\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":\"answered directly\"},\"timestamp\":\"$FUTURE_ISO\"}" >> "$TRANSIENT3"
 
 # Wait for reconcile loop (5s interval, but we can trigger manually by waiting)
 sleep 6
@@ -295,8 +297,9 @@ fi
 echo "[ok] Queue state survived daemon restart (SQLite persistence)"
 
 # Advance transcript — reconcile should dequeue
-FUTURE_TS=$(( $(date +%s%3N) + 60000 ))
-echo "{\"type\":\"user\",\"role\":\"user\",\"content\":\"answered\",\"timestamp\":$FUTURE_TS}" >> "$TRANSIENT4"
+# Use real Claude Code format with ISO timestamp
+FUTURE_ISO=$(date -d "+60 seconds" -Iseconds)
+echo "{\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":\"answered\"},\"timestamp\":\"$FUTURE_ISO\"}" >> "$TRANSIENT4"
 sleep 6
 COUNT=$(queue_count)
 if [ "$COUNT" -eq 0 ]; then
@@ -418,6 +421,61 @@ else
   exit 1
 fi
 echo "[pass] AS-7 complete"
+
+reset_daemon
+# ========================================================================
+# AS-8: Real transcript format (ISO timestamps, nested message.role)
+# ========================================================================
+echo ""
+echo "=== AS-8: Real transcript format validation ==="
+
+PANE8=$(create_session "${TEST_BASE}-as8")
+# Create a transcript with pre-stuck content
+TRANSIENT8="$TB_DIR/test-transcript-as8.jsonl"
+# Use current time minus 30 seconds for pre-stuck content
+PRE_STUCK_TS=$(date -d "30 seconds ago" -Iseconds)
+# Create initial user message
+cat > "$TRANSIENT8" <<EOF
+{"type":"user","message":{"role":"user","content":"hello"},"timestamp":"$PRE_STUCK_TS"}
+EOF
+
+send_stop "$PANE8" "as8" "$TRANSIENT8" "Session with real-format transcript"
+
+sleep 1
+COUNT=$(queue_count)
+if [ "$COUNT" -eq 1 ]; then
+  echo "[ok] Session queued with real-format transcript"
+else
+  echo "[fail] Expected count=1, got $COUNT"
+  exit 1
+fi
+
+# (a) Session should stay queued - reconcile loop should check and see no new content
+sleep 6
+COUNT=$(queue_count)
+if [ "$COUNT" -eq 1 ]; then
+  echo "[ok] Session stays queued (no new content after stuck time)"
+else
+  echo "[fail] Expected count=1 (still queued), got $COUNT"
+  exit 1
+fi
+
+# (b) Append real-format user entry timestamped after stuck time - should dequeue within one sweep
+# Use current time to ensure it's after the stuck time
+POST_STUCK_TS=$(date -Iseconds)
+echo "{\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":\"answered directly\"},\"timestamp\":\"$POST_STUCK_TS\"}" >> "$TRANSIENT8"
+
+# Wait for reconcile loop (5s interval) - should dequeue within one sweep
+sleep 6
+COUNT=$(queue_count)
+if [ "$COUNT" -eq 0 ]; then
+  echo "[ok] Reconcile dequeued after appending real-format user entry"
+else
+  echo "[fail] Expected count=0 after reconcile, got $COUNT"
+  exit 1
+fi
+
+echo "[pass] AS-8 complete"
 
 # ========================================================================
 # Summary
