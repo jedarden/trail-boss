@@ -27,17 +27,6 @@ setInterval(() => cleanupQueue(), 60 * 60 * 1000);
 const server = http.createServer(async (req, res) => {
   const url = new URL(req.url || "", `http://${req.headers.host}`);
 
-  // CORS for local testing
-  res.setHeader("Access-Control-Allow-Origin", "*");
-  res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
-  res.setHeader("Access-Control-Allow-Headers", "Content-Type, X-Tmux-Pane");
-
-  if (req.method === "OPTIONS") {
-    res.writeHead(204);
-    res.end();
-    return;
-  }
-
   try {
     // POST /event - hook ingest endpoint
     if (req.method === "POST" && url.pathname === "/event") {
