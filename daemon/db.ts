@@ -185,6 +185,25 @@ export function getSessionsForReconcile(limit: number = 100): Array<{
   return stmt.all(limit) as ReturnType<typeof getSessionsForReconcile>;
 }
 
+// Stuck-direction reconcile: get sessions that are not currently queued
+// (for detecting sessions that became stuck while daemon was down)
+export function getSessionsNotInQueue(limit: number = 100): Array<{
+  session_id: string;
+  pane_id: string;
+  transcript_path: string;
+  cwd: string;
+}> {
+  const stmt = db.prepare(`
+    SELECT s.session_id, s.pane_id, s.transcript_path, s.cwd
+    FROM sessions s
+    LEFT JOIN queue q ON s.session_id = q.session_id AND q.dequeued_at IS NULL
+    WHERE q.session_id IS NULL
+    ORDER BY s.last_seen_at DESC
+    LIMIT ?
+  `);
+  return stmt.all(limit) as ReturnType<typeof getSessionsNotInQueue>;
+}
+
 // Cleanup old dequeued items
 export function cleanupQueue(olderThanMs: number = 24 * 60 * 60 * 1000): void {
   const cutoff = Date.now() - olderThanMs;

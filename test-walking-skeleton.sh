@@ -34,7 +34,7 @@ sleep 1
 echo "[setup] Starting daemon..."
 mkdir -p "$DATA_DIR"
 cd "$TB_DIR/daemon"
-bun index.ts &
+TMUX_TEST_SOCK="$TMUX_TEST_SOCK" bun index.ts &
 DAEMON_PID=$!
 sleep 2
 
@@ -137,12 +137,17 @@ next_pane() {
 reset_daemon() {
   kill $DAEMON_PID 2>/dev/null || true
   sleep 1
+  # Kill all test sessions to ensure clean state
+  $TMUX kill-server 2>/dev/null || true
+  sleep 1
   rm -rf "$DATA_DIR"
   mkdir -p "$DATA_DIR"
   cd "$TB_DIR/daemon"
-  bun index.ts &
+  TMUX_TEST_SOCK="$TMUX_TEST_SOCK" bun index.ts &
   DAEMON_PID=$!
   sleep 2
+  # Restart the tmux server for subsequent tests
+  $TMUX start-server 2>/dev/null || true
 }
 
 # ========================================================================
@@ -259,57 +264,84 @@ echo "[pass] AS-3 complete"
 
 reset_daemon
 # ========================================================================
-# AS-4: Dropped-event recovery
+# AS-4: Dropped-event recovery (full stuck-direction reconcile)
 # ========================================================================
 echo ""
 echo "=== AS-4: Dropped-event recovery ==="
-# NOTE: The daemon reconcile loop only checks sessions already in the DB.
-# True dropped-event discovery (POST lost before registration) is a known
-# gap — the daemon has no startup transcript scan. This test validates the
-# achievable subset: session is registered, daemon restarts, SQLite state
-# survives, reconcile continues dequeuing when the transcript advances.
 
+# First, register a session (simulating SessionStart hook)
 PANE4=$(create_session "${TEST_BASE}-as4")
 TRANSIENT4=$(create_transcript "as4")
-send_stop "$PANE4" "as4" "$TRANSIENT4" "Registered before restart"
+# Register session via SessionStart event
+curl -s -X POST "$DAEMON_URL/event" \
+  -H "Content-Type: application/json" \
+  -H "X-Tmux-Pane: $PANE4" \
+  -d "{
+    \"session_id\": \"as4\",
+    \"transcript_path\": \"$TRANSIENT4\",
+    \"cwd\": \"$TB_DIR\",
+    \"hook_event_name\": \"SessionStart\"
+  }" >/dev/null
 sleep 1
 
+# Verify session is registered (count should be 0 since it's not stuck yet)
 COUNT=$(queue_count)
-if [ "$COUNT" -ne 1 ]; then
-  echo "[fail] Expected count=1 before restart, got $COUNT"
+if [ "$COUNT" -ne 0 ]; then
+  echo "[fail] Expected count=0 after registration (not stuck yet), got $COUNT"
   exit 1
 fi
+echo "[ok] Session registered but not queued (not stuck yet)"
 
-# Kill and restart daemon WITHOUT wiping DB (simulates crash/restart)
+# Kill daemon WITHOUT wiping DB (simulating it going down while session is active)
+# Use a different approach: only kill the daemon, not reset the DB
 kill $DAEMON_PID 2>/dev/null || true
 sleep 1
+
+# While daemon is down, append a stuck-shaped assistant tail to the transcript
+# (simulating that the session stopped and the POST was lost because daemon was down)
+# Use current time for the stuck timestamp
+STUCK_ISO=$(date -Iseconds)
+echo "{\"type\":\"assistant\",\"message\":{\"role\":\"assistant\",\"content\":\"This session stopped while the daemon was down\"},\"timestamp\":\"$STUCK_ISO\"}" >> "$TRANSIENT4"
+echo "[setup] Appended stuck assistant tail to transcript while daemon was down"
+
+# Restart daemon - it should scan transcripts and enqueue the stuck session
+# DB still has the session registration
 cd "$TB_DIR/daemon"
-bun index.ts &
+TMUX_TEST_SOCK="$TMUX_TEST_SOCK" bun index.ts &
 DAEMON_PID=$!
 sleep 2
 
-# DB state survived — session should still be queued
+# Session should appear in queue within one sweep (startup reconcile runs immediately)
+# Give it a moment to complete the startup reconcile
+sleep 1
 COUNT=$(queue_count)
 if [ "$COUNT" -ne 1 ]; then
-  echo "[fail] Expected count=1 after restart (DB survived), got $COUNT"
+  echo "[fail] Expected count=1 after daemon restart (stuck-direction reconcile should have recovered), got $COUNT"
   exit 1
 fi
-echo "[ok] Queue state survived daemon restart (SQLite persistence)"
+echo "[ok] Stuck-direction reconcile recovered session from transcript (daemon was down when Stop fired)"
 
-# Advance transcript — reconcile should dequeue
-# Use real Claude Code format with ISO timestamp
+# Verify the session in queue is the correct one
+NEXT=$(next_pane)
+if [ "$NEXT" = "$PANE4" ]; then
+  echo "[ok] /next returns the recovered session"
+else
+  echo "[fail] Expected pane $PANE4, got $NEXT"
+  exit 1
+fi
+
+# Now verify reconcile still dequeues when user answers directly
 FUTURE_ISO=$(date -d "+60 seconds" -Iseconds)
-echo "{\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":\"answered\"},\"timestamp\":\"$FUTURE_ISO\"}" >> "$TRANSIENT4"
+echo "{\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":\"answered directly\"},\"timestamp\":\"$FUTURE_ISO\"}" >> "$TRANSIENT4"
 sleep 6
 COUNT=$(queue_count)
 if [ "$COUNT" -eq 0 ]; then
-  echo "[ok] Reconcile dequeued after transcript advanced post-restart"
+  echo "[ok] Reconcile dequeued after user answered directly in pane"
 else
-  echo "[fail] Expected count=0 after reconcile, got $COUNT"
+  echo "[fail] Expected count=0 after user answered, got $COUNT"
   exit 1
 fi
-echo "[pass] AS-4 complete"
-echo "[note] AS-4 gap: POST-lost-before-registration not recoverable (no startup scan)"
+echo "[pass] AS-4 complete (full stuck-direction recovery validated)"
 
 reset_daemon
 # ========================================================================
