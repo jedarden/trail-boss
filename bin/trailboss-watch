@@ -2,6 +2,7 @@
 # Trail Boss live queue dashboard.
 # Runs in the operator session and continuously shows stuck sessions.
 # Press a number to jump to that session; r to refresh; q to quit.
+set +e  # read -t returns 1 on timeout; must not exit on that
 
 DAEMON_URL="${TRAILBOSS_URL:-http://127.0.0.1:4000}"
 TB_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)"
@@ -46,12 +47,21 @@ render() {
   printf "  %-4s %-10s %-22s %s\n" "NUM" "REASON" "SESSION" "LAST MESSAGE"
   printf "  %s\n" "$(printf '%.0s─' {1..70})"
 
+  # Build pane→tmux-session-name map in one tmux call
+  declare -A TMUX_SESSION_MAP
+  while IFS=: read -r p s; do
+    TMUX_SESSION_MAP["$p"]="$s"
+  done < <(tmux list-panes -a -F '#{pane_id}:#{session_name}' 2>/dev/null)
+
   # Build indexed list
   PANE_MAP=()
   local idx=1
-  while IFS='|' read -r pane_id reason session_name message; do
+  while IFS='|' read -r pane_id reason cwd_label sess_label message; do
     PANE_MAP[$idx]="$pane_id"
-    printf "  [%2d] %-10s %-22s %s\n" "$idx" "$reason" "$session_name" "${message:0:30}"
+    # Prefer tmux session name; fall back to cwd last component, then session_id prefix
+    label="${TMUX_SESSION_MAP[$pane_id]:-$cwd_label}"
+    [ -z "$label" ] && label="$sess_label"
+    printf "  [%2d] %-10s %-22s %s\n" "$idx" "$reason" "$label" "${message:0:30}"
     idx=$((idx + 1))
   done < <(echo "$json" | python3 -c "
 import json, sys
@@ -63,7 +73,7 @@ for item in d.get('items', []):
     msg   = (item.get('last_message') or '').replace('\n',' ')[:30]
     cwd   = item.get('cwd','').split('/')[-1]
     label = cwd if cwd else sess
-    print(f'{pane}|{reason}|{label}|{msg}')
+    print(f'{pane}|{reason}|{label}|{sess}|{msg}')
 " 2>/dev/null)
 
   printf "\n  [1-%d] jump to session   [s] skip head   [r] refresh   [q] quit\n" "$((idx-1))"

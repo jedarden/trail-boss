@@ -5,3 +5,10 @@
 
 # Beads: db is regenerable from issues.jsonl
 .beads/*.db
+
+# TUI build artifacts
+tui/tui
+bin/trailboss-tui
+
+# Accidentally created tilde directory
+~

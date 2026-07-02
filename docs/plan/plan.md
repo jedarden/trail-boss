@@ -502,6 +502,158 @@ phase complete on code-read alone; run the scenario and observe it.
 
 ---
 
+## Phase 8: TUI rewrite (planned)
+
+The bash-based `trailboss-watch` and `trailboss-popup` scripts work but hit a ceiling: no
+cursor-addressable rendering, no dual-pane layout, no color, no detail panel. The reference
+point for what this should look like is **[beads_viewer](https://github.com/dicklesworthstone/beads_viewer)**
+by dicklesworthstone — a Go + Bubble Tea queue browser with kanban layout, dependency graph,
+insights dashboard, box-drawing borders, Dracula-inspired theming, and vim-style keyboard nav.
+
+**Scope:** Replace the presentation layer only. The daemon (Bun/SQLite, HTTP on 4000) stays
+unchanged. The new TUI is a separate process that polls the daemon's existing `/queue` and
+`/next`/`/skip` endpoints and issues `tmux` navigation commands, exactly as the bash scripts do
+now. No daemon changes required.
+
+### Technology decision
+
+Two credible options, both with mature component ecosystems:
+
+| | **Go + Bubble Tea** | **TypeScript + Ink** |
+|---|---|---|
+| Ecosystem match | Exact match to beads_viewer | React-in-terminal, similar MVC model |
+| Runtime | Single static binary, instant start | Bun (already present on host) |
+| Shared types with daemon | No — HTTP is the interface anyway | Yes — but HTTP already decouples them |
+| UI components | `charmbracelet/bubbles` (lists, tables, viewports, spinners) | `ink-table`, `ink-spinner`, `ink-text-input` — smaller ecosystem |
+| Styling | Lipgloss — semantic theme system, box borders, adaptive color | Chalk + custom — functional but manual |
+| Recommendation | **Preferred for UI quality ceiling** | Acceptable if Go adds too much friction |
+
+**Decision:** Go + Bubble Tea. The Charm stack (Bubbletea + Bubbles + Lipgloss) has exactly the
+components needed (list, viewport, table) and the beads_viewer codebase is a working reference.
+The daemon remains TypeScript; the TUI binary communicates via HTTP and tmux commands, so the
+language boundary is clean. A Bun/TypeScript fallback remains viable if Go proves problematic.
+
+### Layout
+
+The new TUI runs in the `trail-boss:1` tmux window (replacing `trailboss-watch`). It occupies
+the full window and uses a persistent split layout:
+
+```
+┌─ Trail Boss ─────────────────────────────────────────────────────┐
+│ ⚠ 12 stuck   [Tab] next   [S] skip   [Enter] jump   [q] quit    │  ← header bar
+├───────────────────────────┬──────────────────────────────────────┤
+│  # │ REASON  │ SESSION    │  Detail: alpha — 4m 12s              │
+│  ─────────────────────────│  ──────────────────────────────────  │
+│  1 │ stopped │ alpha    ▶ │  cwd: /home/coding/trail-boss        │
+│  2 │ stopped │ bravo      │  stuck at: 14:22:03                  │
+│  3 │ stopped │ charlie    │                                       │
+│  4 │ perm    │ delta      │  Last message:                       │
+│  5 │ stopped │ foxtrot    │  "I've updated the reconcile loop    │
+│  6 │ stopped │ golf       │   to filter cooldown entries in      │
+│  7 │ stopped │ hotel      │   getAllStuck(). The test for AS-5   │
+│  8 │ perm    │ india      │   should now pass. Run:              │
+│  9 │ stopped │ juliet     │     bun test-walking-skeleton.sh     │
+│ 10 │ stopped │ lima       │   to verify."                        │
+│ 11 │ stopped │ mike       │                                       │
+│ 12 │ stopped │ tg-bridge  │                                       │
+├───────────────────────────┴──────────────────────────────────────┤
+│  daemon: ok   queue: 12   reconcile: 5s ago   skip cooldown: —   │  ← status bar
+└──────────────────────────────────────────────────────────────────┘
+```
+
+- **List pane** (left, ~40% width): scrollable queue list, cursor row highlighted, reason
+  color-coded, selected item marked with `▶`. Adapts to single-column on narrow terminals
+  (<100 cols).
+- **Detail pane** (right, ~60% width): shows full `last_message` for the highlighted item,
+  wrapped and scrollable; session metadata (CWD, tmux session name, time stuck as relative
+  duration). For `permission` reason entries, shows the proposed tool name and input.
+- **Header bar**: ambient stuck count + key legend. Color changes to red when queue is non-empty.
+- **Status bar**: daemon health, queue depth, last reconcile, active skip cooldown countdown.
+
+### Components (Bubble Tea / Lipgloss)
+
+| Component | Bubble Tea primitive | Purpose |
+|---|---|---|
+| Queue list | `bubbles/list` | Scrollable item list with custom delegate |
+| Detail viewport | `bubbles/viewport` | Scrollable message body |
+| Status bar | Custom `lipgloss.NewStyle()` row | Single-line metrics |
+| Header | Custom lipgloss row | Key legend + count badge |
+| Loading spinner | `bubbles/spinner` | While daemon poll in-flight |
+
+### Color scheme (Dracula-inspired, matches beads_viewer)
+
+| State | Color | Usage |
+|---|---|---|
+| `stopped` | Yellow `#F1FA8C` | Reason badge |
+| `permission` | Red `#FF5555` | Reason badge |
+| Selected row | Purple `#BD93F9` bg | Cursor highlight |
+| Header bar | Cyan `#8BE9FD` | Count badge when >0 |
+| Header bar | Green `#50FA7B` | Count badge when 0 |
+| Border | Comment gray `#6272A4` | Panel borders (rounded) |
+| Status bar | Subdued gray `#44475A` bg | Footer |
+| Metadata | Foreground gray `#AAAAAA` | CWD / timestamp lines |
+
+Auto-detect terminal color support; degrade gracefully (no-color mode for dumb terminals).
+
+### Keyboard map
+
+| Key | Action |
+|---|---|
+| `j` / `↓` | Move cursor down |
+| `k` / `↑` | Move cursor up |
+| `g g` | Jump to top |
+| `G` | Jump to bottom |
+| `ctrl+d` | Page down |
+| `ctrl+u` | Page up |
+| `Enter` or `l` | Jump to highlighted session (switch tmux client) |
+| `Tab` | Jump to queue head (same as `prefix+Tab` tmux binding) |
+| `s` | Skip head + advance |
+| `r` | Force refresh from daemon |
+| `J` / `K` | Scroll detail pane down / up |
+| `q` / `ctrl+c` | Quit TUI |
+| `?` | Toggle help overlay |
+
+Numbers `1`–`N` remain supported for direct jump (matches current behavior).
+
+### Polling & refresh
+
+- **On startup:** fetch `/queue` and `/status`.
+- **Auto-refresh:** poll `/queue` every 3 seconds (same as current watch). Use a `tea.Tick`
+  command; no WebSocket needed.
+- **After jump/skip:** immediately re-poll to reflect updated queue state.
+- **Daemon unreachable:** show inline error in status bar (`daemon: unreachable ✗`), retry every
+  3s without crashing the TUI.
+
+### Navigation calls
+
+The TUI binary calls `tmux` directly (same as the bash scripts):
+
+```go
+// Jump to selected pane
+func jumpToPanre(paneID string) error {
+    sessName, _ := tmuxDisplay(paneID, "#{session_name}")
+    return tmuxRun("switch-client", "-t", sessName,
+        ";", "select-window", "-t", paneID,
+        ";", "select-pane", "-t", paneID)
+}
+```
+
+The origin file (`/tmp/trailboss-origin`) is written before every jump so `prefix+B` / `trailboss return` still works.
+
+### Exit criteria (Phase 8 done when)
+
+- TUI renders in `trail-boss:1` with list pane and detail pane, box-drawing borders, color-coded reasons.
+- Cursor navigation (j/k/gg/G/ctrl+d/ctrl+u) works; selected item drives detail pane content.
+- `Enter` jumps client to the selected session's pane; `/tmp/trailboss-origin` written.
+- `s` skips head; queue updates on next tick.
+- Auto-refresh every 3s; count in header bar tracks daemon.
+- Daemon-unreachable state shown inline, recovers automatically when daemon restarts.
+- Narrow terminal (<100 cols): list only, no detail pane, no crash.
+- `trailboss-start` launches the new binary in `trail-boss:1` in place of `trailboss-watch`.
+- All Phase 6 acceptance scenarios (AS-1 through AS-7) still pass with the new TUI.
+
+---
+
 ## Open questions
 
 **Open**
@@ -516,10 +668,15 @@ phase complete on code-read alone; run the scenario and observe it.
    "Switching & keybindings": Next/Popup/Skip keys, operator-initiated jump, manual tmux nav is
    orthogonal). The only residual is whether to offer an opt-in "auto-jump on resolve" toggle —
    decide after the walking skeleton.
-4. **Presentation polish** — the mechanism is specified (`display-popup` picker + Next/Skip
-   keybindings + status-line segment). Residual polish: exact key choices, popup layout/columns,
-   and whether a dedicated always-visible window is worth adding alongside the popup. Tune after
-   the walking skeleton.
+4. **Presentation polish** — resolved by Phase 8 (TUI rewrite). The mechanism switches from
+   `display-popup` bash scripts to a persistent Go+Bubble Tea window. Key choices finalized:
+   `prefix+Tab` (Next), `prefix+S` (Skip), `prefix+g` (popup overlay if kept), `prefix+B`
+   (Return). Popup may be retired once the persistent TUI window is the primary surface.
+5. **Popup vs. persistent window** — the current `trailboss-popup` (`display-popup -E`) overlays
+   a transient picker. The Phase 8 TUI is a persistent window. Decide whether to keep the popup
+   as a second surface (useful when already in an agent session) or retire it in favor of
+   `prefix+B` → persistent window. Likely keep both: popup for quick in-session triage, window
+   for sustained depletion work.
 
 **Resolved this round (recorded so they don't get re-litigated)**
 
@@ -531,3 +688,73 @@ phase complete on code-read alone; run the scenario and observe it.
 - *Reboot durability* → out; operator re-invokes after restart.
 - *Concurrency ceiling* → non-issue; the depletion loop just loads the next one, no ceiling
   logic.
+- *TUI language* → Go + Bubble Tea (Phase 8). Daemon stays TypeScript/Bun. HTTP is the
+  interface; the boundary is clean.
+
+---
+
+## Phase 9: Supervisor Split View
+
+The Phase 8 TUI occupies a full window: the operator has no ambient view of the session they are about to jump into, and after jumping away there are no visible hotkey reminders. Phase 9 converts `trail-boss:dashboard` into a vertical split so a live preview of the target pane is always visible without leaving the TUI.
+
+### Layout
+
+```
+┌─ trail-boss:dashboard ─────────────────────────────────────────┐
+│                                                                 │  60% — trailboss-tui
+│  [queue list]         │  [detail pane]                         │
+│                       │                                        │
+├─────────────────────────────────────────────────────────────────┤
+│ ─── alpha:claude.1 ─────────────────────────────────────────── │  40% — trailboss-preview
+│  [live tmux capture of selected pane]                          │
+│                                                                 │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+- **Top pane (60%)** — `trailboss-tui` binary, unchanged except for preview sync.
+- **Bottom pane (40%)** — `trailboss-preview` bash script; read-only live capture.
+
+### trailboss-preview
+
+A polling bash loop that:
+
+1. Reads `/tmp/trailboss-preview-target` (a pane_id such as `%17`).
+2. Runs `tmux capture-pane -p -e -t <pane_id>` to get the rendered terminal content.
+3. Clears and reprints the output with a cyan session label header.
+4. Sleeps 0.5 s and repeats.
+
+Shows a dim placeholder when the file is absent, empty, or the pane_id is stale.
+
+### TUI changes
+
+On every cursor movement and queue update, the TUI calls `WritePreviewTarget(paneID)` — a fire-and-forget `os.WriteFile` to `/tmp/trailboss-preview-target`. No blocking, no error surfaced to the user.
+
+`Enter` behavior is unchanged: `tmux switch-client` to the agent session. The split view is not visible during interaction. `prefix+B` returns the client to `trail-boss:dashboard.0` (the TUI pane).
+
+### trailboss-start changes
+
+Instead of `exec`-ing in the current shell, `trailboss-start` now:
+
+1. Kills the `dashboard` window if it exists.
+2. Creates a new detached `dashboard` window running `trailboss-tui`.
+3. Splits it vertically at 40% running `trailboss-preview` in the bottom pane.
+4. Switches the current client to `trail-boss:dashboard.0`.
+
+This makes `trailboss-start` callable from any session — it always (re)creates the split and lands the operator in the TUI.
+
+### Keybinding changes
+
+| Binding | Old | New |
+|---|---|---|
+| `prefix+B` | Switch to `/tmp/trailboss-origin` session | Always `switch-client -t trail-boss:dashboard` + `select-pane .0` |
+| `prefix+Down` | (unbound — tmux native) | Focus preview pane for inspection |
+
+### Exit criteria (Phase 9 done when)
+
+- `trailboss-start` creates the split `dashboard` window and lands the client in the TUI pane.
+- Cursor movement in the TUI updates `/tmp/trailboss-preview-target` within the current render cycle.
+- `trailboss-preview` renders a live capture of the target pane, refreshing at ~0.5 s.
+- `prefix+B` from any session returns to `trail-boss:dashboard.0`.
+- `Enter` still performs `switch-client` to the agent session; `prefix+B` restores the split view.
+- `trailboss-preview` does not crash when the target pane_id is stale or absent.
+- All Phase 8 exit criteria remain satisfied.

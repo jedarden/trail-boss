@@ -1,0 +1,35 @@
+#!/bin/bash
+# Live preview pane: mirrors the tmux pane selected in the TUI above.
+# Reads /tmp/trailboss-preview-target (a pane_id like %17), captures the
+# live terminal content, and renders the last N lines to fit the pane.
+
+TARGET_FILE="/tmp/trailboss-preview-target"
+
+while true; do
+    target=$(cat "$TARGET_FILE" 2>/dev/null | tr -d '[:space:]')
+
+    # How many lines can we display? Reserve 1 for the header.
+    pane_h=$(tmux display-message -p "#{pane_height}" 2>/dev/null || echo 12)
+    content_lines=$(( pane_h - 1 ))
+    [ "$content_lines" -lt 1 ] && content_lines=1
+
+    if [ -n "$target" ]; then
+        label=$(tmux display -p -t "$target" \
+            "#{session_name}:#{window_name}" 2>/dev/null)
+        if output=$(tmux capture-pane -p -e -t "$target" 2>/dev/null); then
+            # Tail to content_lines so we don't scroll past the header
+            visible=$(printf '%s\n' "$output" | tail -n "$content_lines")
+            clear
+            printf '\033[1;36m─── %s \033[0m\n' "${label:-$target}"
+            printf '%s\n' "$visible"
+        else
+            clear
+            printf '\033[2m(pane %s not found)\033[0m\n' "$target"
+        fi
+    else
+        clear
+        printf '\033[2m(no session selected — navigate in trail boss above)\033[0m\n'
+    fi
+
+    sleep 0.5
+done

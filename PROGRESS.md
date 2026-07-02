@@ -116,4 +116,47 @@
 **Next:**
 - Phase 7: Iterate — polish, edge cases, and enhancement loop
 
-## Phase 7: Iterate (PENDING)
+## Phase 7: Iterate (IN PROGRESS)
+
+**Done:**
+- Dashboard labels: `trailboss-watch` now resolves pane_id → tmux session name (alpha, bravo, etc.) via a single `tmux list-panes -a` call per render, falling back to CWD last component
+- Fixed `prefix+s` conflict with tmux's built-in session chooser → moved skip to `prefix+S`
+- `trailboss-start` auto-creates the `trail-boss` tmux session if it doesn't exist
+- Confirmed real hooks firing and dequeuing bootstrap entries correctly (ended/unstuck events in daemon log)
+
+**Verified working end-to-end:**
+- Daemon running in `trail-boss:daemon` window (stable, survives shell exits)
+- Dashboard showing NATO session names (alpha → mike) + telegram-bridge panes
+- Real Claude Code hooks (Stop, UserPromptSubmit) dequeuing sessions as they become active
+
+## Phase 9: Supervisor Split View ✅ COMPLETE
+
+**Done:** `trail-boss:dashboard` is now a 2-pane split — TUI on top (60%), live preview on bottom (40%).
+
+**Implemented:**
+- `bin/trailboss-preview` — bash loop: reads `/tmp/trailboss-preview-target`, renders `tmux capture-pane` output every 0.5s
+- `tui/client.go` — `WritePreviewTarget()` writes selected pane_id to target file
+- `tui/model.go` — `syncPreview()` called on every cursor movement + queue update
+- `bin/trailboss-start` — kill-session + fresh session; uses stable window ID (`@NNN`) + pane ID (`%NNN`) to avoid pane-base-index and auto-rename pitfalls; passes command directly to `split-window` (no send-keys race)
+- `tmux.conf` — `prefix+B` always returns to `trail-boss:dashboard`
+- `bin/trailboss` — `return` command targets `trail-boss:dashboard`
+
+## Phase 8: TUI Rewrite ✅ COMPLETE
+
+**Done:** Replaced bash-based `trailboss-watch`/`trailboss-popup` with a proper Go + Bubble Tea TUI.
+
+**Implemented:**
+- `tui/client.go` — HTTP client for daemon, tmux pane map, JumpToPane with origin tracking
+- `tui/theme.go` — Dracula palette Lipgloss styles with dumb-terminal fallback
+- `tui/model.go` — Full Bubble Tea model: split layout, vim keys, auto-refresh, help overlay
+- `tui/main.go` — Entry point with AltScreen + mouse support
+- `bin/trailboss-tui` — Pre-built binary (10MB, Go 1.24.2)
+- `bin/trailboss-start` — Updated to `exec "$TB_DIR/bin/trailboss-tui"`
+
+**Features:**
+- Split layout: list (40%) + detail (60%) for width≥100, list-only for narrow terminals
+- Color: stopped=yellow `#F1FA8C`, permission=red `#FF5555`, selected=purple `#BD93F9`
+- Keys: j/k, gg/G, ctrl+d/ctrl+u, Enter (jump), l/Tab (detail focus), s (skip), r (refresh), J/K (detail scroll), 1-9 (direct jump), ? (help), q (quit)
+- Auto-refresh every 3s; graceful daemon-unreachable display in status bar
+- Detail pane: word-wrapped last_message, CWD, relative stuck time
+- Help overlay centered with rounded border
