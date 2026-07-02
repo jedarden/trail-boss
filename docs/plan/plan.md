@@ -657,21 +657,24 @@ The origin file (`/tmp/trailboss-origin`) is written before every jump so `prefi
 
 **Open**
 
-1. **Harness layering / adapter contract** *(the main one)* — define the normalized
-   stuck/unstuck event the daemon consumes, so detection stays isolated to a per-harness
-   adapter. Is a purely tmux-level detector (no hooks) viable as a universal fallback for future
-   harnesses? See "Layering" above.
-2. ~~**`PermissionRequest` specifics** — confirm it fires for the gate types you hit and what its
-   payload carries (the proposed command, for display). Detection coverage depends on it; phase 1.~~ **Resolved (probe 2026-05-25):** confirmed firing with `tool_name` + `tool_input` payload; permission block emits `PermissionRequest` and **no** `Stop`.
-3. **Auto-advance residual** — the trigger, jump model, and keybindings are specified (see
+1. **Auto-advance residual** — the trigger, jump model, and keybindings are specified (see
    "Switching & keybindings": Next/Popup/Skip keys, operator-initiated jump, manual tmux nav is
    orthogonal). The only residual is whether to offer an opt-in "auto-jump on resolve" toggle —
    decide after the walking skeleton.
-4. **Presentation polish** — resolved by Phase 8 (TUI rewrite). The mechanism switches from
+
+**Resolved (recorded so they don't get re-litigated)**
+
+~~1. **Harness layering / adapter contract** — define the normalized stuck/unstuck event the daemon consumes, so detection stays isolated to a per-harness adapter. Is a purely tmux-level detector (no hooks) viable as a universal fallback for future harnesses?~~ **RESOLVED (2026-07-02):** Yes, a purely tmux-level detector is viable as a universal fallback. Implemented in `daemon/tmux-detector.ts` with opt-in via `@tb-` pane title prefix, 30s quiet threshold, and prompt pattern matching. Emits normalized events to daemon's `/event/normalized` endpoint. Low false positive rate (prompt patterns + timeout), minimal performance impact (2s poll interval), harness-agnostic. Full findings in `docs/notes/decisions.md` under "Tmux Detector Viability". For Claude Code, hook-based detection remains primary (full fidelity, zero latency), but the detector enables Trail Boss to work with any future harness lacking hooks.
+
+2. ~~**`PermissionRequest` specifics** — confirm it fires for the gate types you hit and what its
+   payload carries (the proposed command, for display). Detection coverage depends on it; phase 1.~~ **Resolved (probe 2026-05-25):** confirmed firing with `tool_name` + `tool_input` payload; permission block emits `PermissionRequest` and **no** `Stop`.
+
+3. ~~**Presentation polish** — resolved by Phase 8 (TUI rewrite). The mechanism switches from
    `display-popup` bash scripts to a persistent Go+Bubble Tea window. Key choices finalized:
    `prefix+Tab` (Next), `prefix+S` (Skip), `prefix+g` (popup overlay if kept), `prefix+B`
-   (Return). Popup may be retired once the persistent TUI window is the primary surface.
-5. ~~**Popup vs. persistent window** — the current `trailboss-popup` (`display-popup -E`) overlays
+   (Return).~~ **Resolved (Phase 8):** TUI implemented with all specified features. `prefix+Tab` (Next), `prefix+S` (Skip), `prefix+g` (popup), `prefix+B` (return to dashboard).
+
+4. ~~**Popup vs. persistent window** — the current `trailboss-popup` (`display-popup -E`) overlays
    a transient picker. The Phase 8 TUI is a persistent window. Decide whether to keep the popup
    as a second surface (useful when already in an agent session) or retire it in favor of
    `prefix+B` → persistent window. Likely keep both: popup for quick in-session triage, window
@@ -679,6 +682,7 @@ The origin file (`/tmp/trailboss-origin`) is written before every jump so `prefi
 
 **Resolved this round (recorded so they don't get re-litigated)**
 
+- *Harness layering / adapter contract* → tmux detector viable as universal fallback; hook-based detection remains primary for Claude Code.
 - *Permission vs. stopped priority* → none. Stuck is stuck; `reason` is display-only, queue is
   FIFO.
 - *`Notification`* → dropped; `Stop` + `PermissionRequest` cover every stuck case.
@@ -689,6 +693,7 @@ The origin file (`/tmp/trailboss-origin`) is written before every jump so `prefi
   logic.
 - *TUI language* → Go + Bubble Tea (Phase 8). Daemon stays TypeScript/Bun. HTTP is the
   interface; the boundary is clean.
+- *Popup vs. persistent window* → both retained; popup for triage, persistent window for sustained work.
 
 ---
 
