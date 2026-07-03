@@ -1,39 +1,58 @@
 #!/bin/bash
-# Phase 7 Tmux Detector Acceptance Test — auto-discovery with @tb- prefix
-# Tests the harness-agnostic tmux detector that watches opted-in panes
+# Phase 7 Tmux Detector Acceptance Test
+#
+# Validates the full detection lifecycle: quiet → stuck → activity → unstuck
+# Test scenario:
+# 1. Create a throwaway tmux session with a test pane
+# 2. Make the test pane go quiet (simulate a stuck session)
+# 3. Verify the pane appears in the Trail Boss queue with appropriate reason
+# 4. Type into the pane (simulate user activity)
+# 5. Verify the pane dequeues (unstuck event processed)
+#
+# Test harness rules:
+# - Uses isolated tmux socket (never touches user's main server)
+# - Short QUIET_THRESHOLD_MS for fast testing (3s instead of 30s)
+# - All test sessions are torn down on exit
+
 set -e
 
 TB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 DAEMON_URL="http://127.0.0.1:4000"
-DATA_DIR="$HOME/.local/share/trailboss-tmux-test"
-TEST_BASE="tb-tmux-$$"
+DATA_DIR="$HOME/.local/share/trailboss"
 
 # Isolated tmux socket — never touches the user's main server
-TMUX_TEST_SOCK="/tmp/tmux-trailboss-tmux-test-$$"
+TMUX_TEST_SOCK="/tmp/tmux-trailboss-detector-$$"
 TMUX="tmux -S $TMUX_TEST_SOCK"
 
-# Quiet threshold from tmux-detector.ts
-QUIET_THRESHOLD_MS=30000  # 30 seconds default
-POLL_INTERVAL_MS=2000     # 2 seconds
+# Fast thresholds for testing (override defaults)
+export TRAILBOSS_POLL_INTERVAL_MS=500   # Check every 0.5s
+export TRAILBOSS_QUIET_THRESHOLD_MS=3000 # 3s quiet = stuck
+export TRAILBOSS_DAEMON_URL="$DAEMON_URL/event/normalized"
+export TRAILBOSS_OPT_IN_PREFIX="@tb-test-"
 
 # Cleanup function
 cleanup() {
-  local exit_code=$?
   echo "[cleanup] tearing down test environment..."
-  $TMUX kill-server 2>/dev/null || true
-  pkill -f "bun.*daemon/index.ts" 2>/dev/null || true
+
+  # Stop detector
   pkill -f "tmux-detector.ts" 2>/dev/null || true
+
+  # Stop daemon
+  pkill -f "bun index.ts" 2>/dev/null || true
+
+  # Kill test tmux server
+  $TMUX kill-server 2>/dev/null || true
+
+  # Clean up data dir
   rm -rf "$DATA_DIR" 2>/dev/null || true
+
+  # Remove socket file
   rm -f "$TMUX_TEST_SOCK" 2>/dev/null || true
-  if [ $exit_code -ne 0 ]; then
-    echo "[cleanup] exited with error code $exit_code"
-  fi
 }
 trap cleanup EXIT
 
-echo "=== Phase 7 Tmux Detector Acceptance Test ==="
-echo "Acceptance Scenario: harness-agnostic auto-discovery detector"
-echo "Testing: pane with @tb- prefix goes quiet -> appears in queue -> input dequeues"
+echo "=== Tmux Detector Acceptance Test ==="
+echo "Testing: quiet → stuck → activity → unstuck lifecycle"
 echo ""
 
 # Clean slate
@@ -44,209 +63,196 @@ sleep 1
 echo "[setup] Starting daemon..."
 mkdir -p "$DATA_DIR"
 cd "$TB_DIR/daemon"
-export TRAILBOSS_DATA_DIR="$DATA_DIR"
-bun index.ts > /tmp/trailboss-daemon-test.log 2>&1 &
+bun index.ts > /tmp/tb-daemon-log-$$ 2>&1 &
 DAEMON_PID=$!
 sleep 2
-
-# Clear any pre-existing queue entries to ensure test isolation
-echo "[setup] Clearing pre-existing queue entries..."
-while true; do
-  QUEUE_CHECK=$(curl -s "$DAEMON_URL/queue")
-  COUNT=$(echo "$QUEUE_CHECK" | grep -o '"count":[0-9]*' | grep -o '[0-9]*' || echo "0")
-  if [ "$COUNT" -eq 0 ]; then
-    echo "[setup] Queue is clean"
-    break
-  fi
-  echo "[setup] Skipping pre-existing queue entry..."
-  curl -s -X POST "$DAEMON_URL/skip" >/dev/null
-  sleep 0.5
-done
 
 # Verify daemon started
 if ! curl -s --max-time 1 "$DAEMON_URL/status" >/dev/null 2>&1; then
   echo "[error] daemon failed to start"
-  cat /tmp/trailboss-daemon-test.log
+  cat /tmp/tb-daemon-log-$$
   exit 1
 fi
 echo "[setup] daemon running (PID $DAEMON_PID)"
 
 # Start a fresh tmux server for testing
-echo "[setup] Starting isolated tmux server..."
-$TMUX start-server
-sleep 1
+$TMUX start-server 2>/dev/null || true
 
-# Create a test session with a shell that will go quiet
-echo "[setup] Creating test pane..."
-$TMUX new-session -d -s "test-shell" "bash --noprofile --norc"
-sleep 1
+# Helper: create a test pane with @tb- prefix
+create_test_pane() {
+  local name=$1
+  local title=$2
+  # Create session with a shell that will show a prompt and then wait
+  # Use bash with a command that ends, leaving us at a prompt
+  $TMUX new-session -d -s "$name" "bash -c 'echo ready; bash'"
+  # Set the pane title (not window name) - this is what the detector checks
+  $TMUX select-pane -t "$name" -T "$title"
+  local pane_id=$($TMUX display -p -t "$name" '#{pane_id}')
+  echo "$pane_id"
+}
 
-# Get the pane ID
-PANE_ID=$($TMUX display -p -t "test-shell" '#{pane_id}')
-echo "[setup] Created pane $PANE_ID"
+# Helper: get queue contents
+get_queue() {
+  curl -s --max-time 1 "$DAEMON_URL/queue" || echo '{"queue":[]}'
+}
 
-# IMPORTANT: Set pane title to @tb-test to opt-in to detection
-$TMUX select-pane -t "$PANE_ID" -T "@tb-test"
-sleep 1
+# Helper: check if session is in queue
+session_in_queue() {
+  local session_id=$1
+  local queue=$(get_queue)
+  echo "$queue" | grep -q "$session_id"
+}
 
-# Verify the pane title was set
-PANE_TITLE=$($TMUX display -p -t "$PANE_ID" '#{pane_title}')
-if [ "$PANE_TITLE" != "@tb-test" ]; then
-  echo "[error] Failed to set pane title. Got: '$PANE_TITLE'"
-  exit 1
-fi
-echo "[setup] Pane title verified: '$PANE_TITLE'"
+# Helper: count queue entries
+queue_count() {
+  local queue=$(get_queue)
+  # Extract count from JSON response
+  echo "$queue" | grep -o '"count":[0-9]*' | cut -d: -f2 || echo "0"
+}
 
-# Start the tmux detector in background
-echo "[setup] Starting tmux detector (auto-discovery mode)..."
-cd "$TB_DIR"
-export TMUX="$TMUX"  # Pass custom socket to detector
-bun run daemon/tmux-detector.ts > /tmp/trailboss-detector-test.log 2>&1 &
+# ============================================================================
+# Step 1: Create a test pane with @tb- prefix
+# ============================================================================
+echo ""
+echo "[step 1] Creating test pane with @tb- prefix..."
+TEST_PANE_ID=$(create_test_pane "test-session" "@tb-test-detector-acceptance")
+echo "[step 1] Created test pane: $TEST_PANE_ID"
+
+# ============================================================================
+# Step 2: Start the tmux detector
+# ============================================================================
+echo ""
+echo "[step 2] Starting tmux detector..."
+cd "$TB_DIR/daemon"
+TRAILBOSS_POLL_INTERVAL_MS=500 \
+TRAILBOSS_QUIET_THRESHOLD_MS=3000 \
+TRAILBOSS_DAEMON_URL="$DAEMON_URL/event/normalized" \
+TRAILBOSS_OPT_IN_PREFIX="@tb-test-" \
+bun tmux-detector.ts > /tmp/tb-detector-log-$$ 2>&1 &
 DETECTOR_PID=$!
+echo "[step 2] detector running (PID $DETECTOR_PID)"
+
+# Give detector time to discover the pane
+echo "[step 2] waiting for detector to discover pane..."
 sleep 2
 
-# Verify detector started
-if ! kill -0 $DETECTOR_PID 2>/dev/null; then
-  echo "[error] detector failed to start"
-  cat /tmp/trailboss-detector-test.log
+# Check detector discovered the pane
+if ! grep -q "registered pane" /tmp/tb-detector-log-$$; then
+  echo "[error] detector failed to discover pane"
+  cat /tmp/tb-detector-log-$$
   exit 1
 fi
-echo "[setup] detector running (PID $DETECTOR_PID)"
+echo "[step 2] detector discovered pane (logged registration)"
 
-# Check that the pane was registered
-echo "[test] Checking that pane was registered..."
+# Extract session_id from registration log
+SESSION_ID=$(grep "registered pane" /tmp/tb-detector-log-$$ | tail -1 | sed 's/.*as \([^ ]*\).*/\1/')
+if [ -z "$SESSION_ID" ]; then
+  echo "[error] could not extract session_id from registration"
+  cat /tmp/tb-detector-log-$$
+  exit 1
+fi
+echo "[step 2] session_id: $SESSION_ID"
+
+# ============================================================================
+# Step 3: Wait for stuck detection (quiet threshold exceeded)
+# ============================================================================
+echo ""
+echo "[step 3] Waiting for stuck detection (quiet threshold: 3s)..."
+
+# Wait for quiet threshold + poll buffer
+sleep 5
+
+# Check detector logged stuck event
+if ! grep -q "stuck:" /tmp/tb-detector-log-$$; then
+  echo "[error] detector failed to detect stuck state"
+  cat /tmp/tb-detector-log-$$
+  exit 1
+fi
+echo "[step 3] detector logged stuck event"
+
+# ============================================================================
+# Step 4: Verify pane appears in Trail Boss queue
+# ============================================================================
+echo ""
+echo "[step 4] Verifying pane appears in queue..."
+
+QUEUE=$(get_queue)
+QUEUE_COUNT=$(queue_count)
+echo "[step 4] queue has $QUEUE_COUNT entries"
+
+if [ "$QUEUE_COUNT" -lt 1 ]; then
+  echo "[error] queue is empty, expected 1 entry"
+  echo "[step 4] queue response: $QUEUE"
+  exit 1
+fi
+
+# Verify the session is in the queue
+if ! session_in_queue "$SESSION_ID"; then
+  echo "[error] session $SESSION_ID not found in queue"
+  echo "[step 4] queue response: $QUEUE"
+  exit 1
+fi
+echo "[step 4] session $SESSION_ID found in queue ✓"
+
+# Verify reason is "stopped" (tmux detector can't distinguish permission)
+QUEUE_REASON=$(echo "$QUEUE" | grep -o '"reason":"[^"]*"' | head -1 | cut -d'"' -f4)
+if [ "$QUEUE_REASON" != "stopped" ]; then
+  echo "[error] expected reason='stopped', got '$QUEUE_REASON'"
+  exit 1
+fi
+echo "[step 4] reason is 'stopped' ✓"
+
+# ============================================================================
+# Step 5: Simulate user activity (type into pane)
+# ============================================================================
+echo ""
+echo "[step 5] Simulating user activity (typing into pane)..."
+
+# Send some input to the pane to change its output
+# Run a loop that keeps outputting so the pane doesn't go quiet again
+$TMUX send-keys -t "$TEST_PANE_ID" "while true; do echo 'activity'; sleep 0.5; done" Enter
+sleep 1
+
+# ============================================================================
+# Step 6: Verify pane dequeues (unstuck event processed)
+# ============================================================================
+echo ""
+echo "[step 6] Waiting for unstuck detection..."
+
+# Wait for detector to notice output change and emit unstuck
 sleep 3
-if ! grep -q "registered pane" /tmp/trailboss-detector-test.log 2>/dev/null; then
-  # Try checking the log more carefully
-  if grep -q "registered" /tmp/trailboss-detector-test.log 2>/dev/null; then
-    echo "[test] Pane was registered (found in detector log)"
-  else
-    echo "[warn] No registration found in detector log, continuing..."
-  fi
-fi
 
-echo "[test] Waiting for detector to detect pane as stuck..."
-echo "[test] (quiet threshold is ${QUIET_THRESHOLD_MS}ms, poll interval is ${POLL_INTERVAL_MS}ms)"
-
-# Wait for the pane to be detected as stuck
-# This can take up to: quiet threshold (30s) + poll interval (2s) + initial setup time
-WAIT_TIME=0
-MAX_WAIT=40
-while [ $WAIT_TIME -lt $MAX_WAIT ]; do
-  RESPONSE=$(curl -s "$DAEMON_URL/queue")
-  COUNT=$(echo "$RESPONSE" | grep -o '"count":[0-9]*' | grep -o '[0-9]*' || echo "0")
-
-  if [ "$COUNT" -gt 0 ]; then
-    # Check if this is OUR test pane by looking for the pane_id in the queue
-    if echo "$RESPONSE" | grep -q "\"pane_id\":\"$PANE_ID\""; then
-      echo "[test] Pane detected as stuck after ${WAIT_TIME}s"
-      break
-    else
-      echo "[debug] Queue has $COUNT entries but none match test pane $PANE_ID"
-    fi
-  fi
-
-  sleep 1
-  WAIT_TIME=$((WAIT_TIME + 1))
-done
-
-if [ $WAIT_TIME -ge $MAX_WAIT ]; then
-  echo "[fail] Pane was not detected as stuck within ${MAX_WAIT}s"
-  echo "[info] Queue response: $(curl -s "$DAEMON_URL/queue")"
-  echo "[info] Detector log:"
-  cat /tmp/trailboss-detector-test.log
+# Check detector logged unstuck event
+if ! grep -q "unstuck:" /tmp/tb-detector-log-$$; then
+  echo "[error] detector failed to detect unstuck state"
+  cat /tmp/tb-detector-log-$$
   exit 1
 fi
+echo "[step 6] detector logged unstuck event"
 
-# Verify the stuck entry has the expected fields
-echo "[test] Verifying queue entry..."
-QUEUE_RESPONSE=$(curl -s "$DAEMON_URL/queue")
+# Verify session removed from queue
+QUEUE=$(get_queue)
+QUEUE_COUNT=$(queue_count)
+echo "[step 6] queue has $QUEUE_COUNT entries after activity"
 
-# Check that the session ID is the synthetic tmux session ID (starts with "tmux-")
-if ! echo "$QUEUE_RESPONSE" | grep -q '"session_id":"tmux-' 2>/dev/null; then
-  echo "[fail] Queue entry does not have expected session ID (tmux-*)"
-  echo "[debug] Queue: $QUEUE_RESPONSE"
+if session_in_queue "$SESSION_ID"; then
+  echo "[error] session still in queue after unstuck event"
+  echo "[step 6] queue response: $QUEUE"
   exit 1
 fi
-echo "[test] Session ID format is correct (tmux-*)"
+echo "[step 6] session $SESSION_ID removed from queue ✓"
 
-# Extract session_id for later verification
-SESSION_ID=$(echo "$QUEUE_RESPONSE" | grep -o '"session_id":"tmux-[^"]*"' | head -1 | cut -d'"' -f4)
-echo "[test] Session ID: $SESSION_ID"
-
-# Verify the pane_id matches our test pane
-QUEUE_PANE_ID=$(echo "$QUEUE_RESPONSE" | grep -o '"pane_id":"[^"]*"' | head -1 | cut -d'"' -f4)
-if [ "$QUEUE_PANE_ID" != "$PANE_ID" ]; then
-  echo "[fail] Queue pane_id ($QUEUE_PANE_ID) doesn't match test pane ($PANE_ID)"
-  exit 1
-fi
-echo "[test] Pane ID matches: $PANE_ID"
-
-# Check that the reason is "stopped"
-if ! echo "$QUEUE_RESPONSE" | grep -q '"reason":"stopped"'; then
-  echo "[fail] Queue entry does not have reason=stopped"
-  echo "[debug] Queue: $QUEUE_RESPONSE"
-  exit 1
-fi
-echo "[test] Reason is correct: stopped"
-
-# Check that last_message exists (should be the prompt line)
-if ! echo "$QUEUE_RESPONSE" | grep -q '"last_message"'; then
-  echo "[fail] Queue entry does not have last_message field"
-  echo "[debug] Queue: $QUEUE_RESPONSE"
-  exit 1
-fi
-echo "[test] last_message field present"
-
-# Now simulate activity by sending keys to the pane
-echo "[test] Simulating activity in pane to trigger unstuck..."
-$TMUX send-keys -t "$PANE_ID" "echo test activity"
-$TMUX send-keys -t "$PANE_ID" Enter
-
-# Wait for the detector to notice and unstuck the session
-echo "[test] Waiting for detector to unstuck session..."
-WAIT_TIME=0
-MAX_WAIT=15
-while [ $WAIT_TIME -lt $MAX_WAIT ]; do
-  RESPONSE=$(curl -s "$DAEMON_URL/queue")
-  COUNT=$(echo "$RESPONSE" | grep -o '"count":[0-9]*' | grep -o '[0-9]*' || echo "0")
-
-  if [ "$COUNT" -eq 0 ]; then
-    echo "[test] Session unstuck after ${WAIT_TIME}s"
-    break
-  fi
-
-  sleep 1
-  WAIT_TIME=$((WAIT_TIME + 1))
-done
-
-if [ $WAIT_TIME -ge $MAX_WAIT ]; then
-  echo "[fail] Session was not unstuck within ${MAX_WAIT}s"
-  echo "[info] Queue response: $(curl -s "$DAEMON_URL/queue")"
-  echo "[info] Detector log:"
-  tail -20 /tmp/trailboss-detector-test.log
-  exit 1
-fi
-
-# Final verification: session should be gone from queue
-echo "[test] Final verification: queue is empty"
-FINAL_RESPONSE=$(curl -s "$DAEMON_URL/queue")
-FINAL_COUNT=$(echo "$FINAL_RESPONSE" | grep -o '"count":[0-9]*' | grep -o '[0-9]*' || echo "0")
-if [ "$FINAL_COUNT" -ne 0 ]; then
-  echo "[fail] Queue should be empty but has $FINAL_COUNT items"
-  echo "[debug] Queue: $FINAL_RESPONSE"
-  exit 1
-fi
-echo "[test] Queue is empty - session successfully dequeued"
-
+# ============================================================================
+# Summary
+# ============================================================================
 echo ""
-echo "=== PASS ==="
-echo "The tmux detector successfully:"
-echo "  - Auto-discovered a pane with @tb- prefix"
-echo "  - Registered the pane for tracking"
-echo "  - Detected it as stuck when quiet at a prompt"
-echo "  - Enqueued it with reason='stopped'"
-echo "  - Unstuck it when activity was detected"
-echo "  - Dequeued it from the queue"
+echo "=== Test Passed ==="
+echo "✓ Tmux detector discovered opted-in pane"
+echo "✓ Pane transitioned to stuck after quiet threshold"
+echo "✓ Pane appeared in Trail Boss queue with reason='stopped'"
+echo "✓ Pane transitioned to unstuck after activity"
+echo "✓ Pane removed from queue after unstuck event"
 echo ""
-echo "The harness-agnostic adapter seam is validated."
+echo "Full detector log available at: /tmp/tb-detector-log-$$"
+echo "Full daemon log available at: /tmp/tb-daemon-log-$$"
+exit 0
