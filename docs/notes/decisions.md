@@ -29,6 +29,126 @@ newcomers.
 
 ## Design decisions
 
+### Normalized event API endpoint (2026-07-02)
+
+**Decision:** Add a dedicated `/event/normalized` endpoint that accepts pre-normalized stuck/unstuck events.
+
+**Rationale:**
+
+The daemon architecture separates detection (harness-coupled) from the core queue logic (harness-agnostic). To maintain this separation, we need a normalized event contract that isolates harness coupling to the adapter layer.
+
+Two approaches were considered:
+
+1. **New normalized endpoint** (`/event/normalized`): Accepts pre-normalized events with a `type` field. Harness-specific adapters (Claude Code hooks, tmux detector) emit normalized events directly.
+2. **Server-side adapter wrapper**: Keep single `/event` endpoint, register multiple server-side adapters that wrap different event formats in a common Claude hook format.
+
+**Option 1 was chosen** for these reasons:
+
+- **Clean separation**: The adapter lives at the emission site (hook script or detector), not in the daemon. The daemon consumes only normalized events and has no knowledge of harness-specific formats.
+- **Protocol simplicity**: A single `type` field enables discriminated unions and type guards. No header-based routing or format detection required.
+- **Extensibility**: Adding a new harness means writing a new emitter/adapter that outputs normalized events; the daemon remains unchanged.
+- **Testability**: Synthetic events can be POSTed directly to `/event/normalized` without constructing hook payloads.
+
+**Event schema:**
+
+All normalized events share a common structure with a `type` discriminator:
+
+```typescript
+// StuckEvent — session became stuck and needs attention
+{
+  type: "stuck"
+  sessionId: string
+  paneId: string
+  cwd: string
+  transcriptPath: string
+  reason: "stopped" | "permission"
+  message: string  // last_assistant_message or tool_name+input
+  timestamp: number  // unix ms
+}
+
+// UnstuckEvent — session progressed and is no longer stuck
+{
+  type: "unstuck"
+  sessionId: string
+  timestamp: number
+}
+
+// SessionRegistered — initial session registration
+{
+  type: "registered"
+  sessionId: string
+  paneId: string
+  cwd: string
+  transcriptPath: string
+  timestamp: number
+}
+
+// SessionEnded — session terminated
+{
+  type: "ended"
+  sessionId: string
+  timestamp: number
+}
+```
+
+**How tmux detector submits events:**
+
+The tmux detector (`daemon/tmux-adapter.ts`) emits normalized events to the daemon:
+
+- **Endpoint:** `POST http://127.0.0.1:4000/event/normalized`
+- **Content-Type:** `application/json`
+- **Payload:** Normalized event JSON (see schema above)
+
+Example stuck event from tmux detector:
+
+```json
+{
+  "type": "stuck",
+  "sessionId": "tmux-%446",
+  "paneId": "%446",
+  "cwd": "/home/coding/trail-boss",
+  "transcriptPath": "",
+  "reason": "stopped",
+  "message": "Quiet at prompt: $ ",
+  "timestamp": 1735689600000
+}
+```
+
+**Type guards:**
+
+The daemon uses type guards based on the `type` field:
+
+```typescript
+function isStuckEvent(event): event is StuckEvent {
+  return event?.type === "stuck";
+}
+function isUnstuckEvent(event): event is UnstuckEvent {
+  return event?.type === "unstuck";
+}
+function isSessionRegistered(event): event is SessionRegistered {
+  return event?.type === "registered";
+}
+function isSessionEnded(event): event is SessionEnded {
+  return event?.type === "ended";
+}
+```
+
+**Alignment with plan architecture:**
+
+This decision directly implements the "Layering: harness-coupled detection vs. harness-agnostic core" guidance from [`docs/plan/plan.md`](../plan/plan.md#L256-L285):
+
+> "To keep the door open for future harnesses without coupling the core, put detection behind an **adapter interface**. The daemon consumes a normalized event — *"session S at pane P became stuck / unstuck"* — and everything downstream (queue, FIFO depletion, navigation) is harness-agnostic."
+
+The `/event/normalized` endpoint **is the normalized event contract** that isolates harness coupling to the adapter layer. The daemon accepts only normalized events (`StuckEvent`, `UnstuckEvent`, `SessionRegistered`, `SessionEnded`) and has no knowledge of harness-specific formats (Claude Code hook payloads, tmux detector heuristics).
+
+The adapter seam is validated:
+- **Claude Code adapter** (`daemon/claude-adapter.ts`): Converts `Stop`/`PermissionRequest` hook payloads → normalized events → POST to `/event/normalized`
+- **Tmux detector adapter** (`daemon/tmux-adapter.ts`): Emits normalized events directly from tmux polling → POST to `/event/normalized`
+
+**Implementation status:** ✅ Complete
+
+The `/event/normalized` endpoint is implemented in `daemon/index.ts` (lines 99-177) and handles all four event types. The Claude Code adapter (`daemon/claude-adapter.ts`) and tmux detector (`daemon/tmux-adapter.ts`) both emit normalized events to this endpoint.
+
 ### Hooks, not polling
 
 Detection is event-driven via Claude Code hooks. A session emits a signal the moment control
