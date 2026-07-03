@@ -1,6 +1,6 @@
 // Trail Boss daemon: ingest endpoint, state, queue, reconcile loop
 import * as http from "http";
-import type { HookEvent } from "./types.ts";
+import type { HookEvent, NormalizedEvent } from "./types.ts";
 import { adaptHookEvent, isStuckEvent, isUnstuckEvent, isSessionRegistered, isSessionEnded } from "./claude-adapter.ts";
 import { upsertSession, deleteSession, enqueue, dequeue, dequeueByPaneId, skipHead, getHead, getStuckCount, getAllStuck, cleanupQueue } from "./db.ts";
 import { startReconcileLoop, reconcileStuckDirection } from "./reconcile.ts";
@@ -89,6 +89,82 @@ const server = http.createServer(async (req, res) => {
       } else if (isSessionEnded(event)) {
         deleteSession(event.sessionId);
         console.log(`[event] ended: ${event.sessionId.slice(0, 8)}`);
+      }
+
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ ok: true }));
+      return;
+    }
+
+    // POST /event/normalized - normalized event ingest endpoint
+    //
+    // This endpoint accepts pre-normalized stuck/unstuck/registered/ended events
+    // directly from harness-agnostic adapters (tmux detector, future hooks).
+    //
+    // Design decision: We chose a separate /event/normalized endpoint over wrapping
+    // tmux events in the Claude hook format because:
+    // 1. Keeps the adapter layer clean — adapters emit normalized events directly
+    // 2. Avoids coupling non-Claude sources to Claude-specific data structures
+    // 3. The normalized contract is already the internal model — we expose it directly
+    //
+    // See docs/notes/decisions.md for full rationale.
+    if (req.method === "POST" && url.pathname === "/event/normalized") {
+      const body: string = await new Promise((resolve) => {
+        let data = "";
+        req.on("data", (chunk) => (data += chunk));
+        req.on("end", () => resolve(data));
+      });
+
+      let event: NormalizedEvent;
+      try {
+        event = JSON.parse(body) as NormalizedEvent;
+      } catch {
+        res.writeHead(400, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: "Invalid JSON" }));
+        return;
+      }
+
+      // Validate type discriminator
+      if (!event.type || !["stuck", "unstuck", "registered", "ended"].includes(event.type)) {
+        res.writeHead(400, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: "Missing or invalid event type" }));
+        return;
+      }
+
+      // Route by event type
+      if (event.type === "stuck") {
+        // Clean up any bootstrap synthetic entry for this pane before registering real session
+        if (event.sessionId !== event.paneId) {
+          dequeueByPaneId(event.paneId, event.sessionId);
+        }
+        upsertSession(
+          event.sessionId,
+          event.paneId,
+          event.cwd,
+          event.transcriptPath,
+          event.timestamp,
+          event.reason,
+          event.message
+        );
+        enqueue(event.sessionId, event.reason, event.timestamp);
+        console.log(`[normalized] stuck: ${event.sessionId.slice(0, 8)} (${event.reason})`);
+      } else if (event.type === "unstuck") {
+        dequeue(event.sessionId);
+        console.log(`[normalized] unstuck: ${event.sessionId.slice(0, 8)}`);
+      } else if (event.type === "registered") {
+        upsertSession(
+          event.sessionId,
+          event.paneId,
+          event.cwd,
+          event.transcriptPath,
+          null,
+          null,
+          null
+        );
+        console.log(`[normalized] registered: ${event.sessionId.slice(0, 8)} -> ${event.paneId}`);
+      } else if (event.type === "ended") {
+        deleteSession(event.sessionId);
+        console.log(`[normalized] ended: ${event.sessionId.slice(0, 8)}`);
       }
 
       res.writeHead(200, { "Content-Type": "application/json" });
