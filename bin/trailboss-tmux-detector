@@ -1,0 +1,53 @@
+#!/usr/bin/env bash
+# Trail Boss tmux detector: watches panes for stuck-state detection
+# Usage: trailboss-tmux-detector <pane-id> [<pane-id> ...]
+#
+# This script starts the tmux-level detector, which polls the specified panes
+# and emits stuck/unstuck events to the daemon when output goes quiet at a prompt.
+#
+# Example:
+#   trailboss-tmux-detector %446 %447
+
+set -euo pipefail
+
+# Colors for output
+readonly GREEN='\033[0;32m'
+readonly YELLOW='\033[0;33m'
+readonly RED='\033[0;31m'
+readonly NC='\033[0m' # No Color
+
+# Trail Boss project root
+readonly PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+
+# Main script
+main() {
+  if [[ $# -eq 0 ]]; then
+    echo "Usage: trailboss-tmux-detector <pane-id> [<pane-id> ...]"
+    echo ""
+    echo "Watches the specified tmux panes for stuck-state detection."
+    echo "When a pane's output goes quiet at a prompt, a stuck event is emitted."
+    echo ""
+    echo "Example:"
+    echo "  trailboss-tmux-detector %446 %447"
+    echo ""
+    echo "Options:"
+    echo "  -h, --help    Show this help message"
+    exit 0
+  fi
+
+  # Handle help flag
+  if [[ "$1" == "-h" || "$1" == "--help" ]]; then
+    "$0" --help  # Call self with no args to show help
+    exit 0
+  fi
+
+  echo -e "${YELLOW}Starting Trail Boss tmux detector...${NC}"
+  echo "Watching panes: $*"
+  echo ""
+
+  # Run the TypeScript detector
+  cd "$PROJECT_ROOT"
+  exec bun run daemon/tmux-detector.ts "$@"
+}
+
+main "$@"
