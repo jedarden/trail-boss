@@ -24,6 +24,7 @@ const DAEMON_URL = process.env.TRAILBOSS_DAEMON_URL || "http://127.0.0.1:4000/ev
 // ============================================================================
 // Types
 // ============================================================================
+// See docs/notes/normalized-event-schema.md for full schema documentation
 
 interface PaneState {
   paneId: string;
@@ -35,16 +36,13 @@ interface PaneState {
   firstSeenAt: number;
 }
 
-interface NormalizedEvent {
-  type: "stuck" | "unstuck" | "registered" | "ended";
-  sessionId?: string;
-  paneId?: string;
-  cwd?: string;
-  transcriptPath?: string;
-  reason?: string;
-  message?: string;
-  timestamp: number;
-}
+// Normalized event types — these must match daemon/types.ts exactly
+// The /event/normalized endpoint accepts these pre-normalized events
+type NormalizedEvent =
+  | { type: "stuck"; sessionId: string; paneId: string; cwd: string; transcriptPath: string; reason: "stopped" | "permission"; message: string; timestamp: number }
+  | { type: "unstuck"; sessionId: string; timestamp: number }
+  | { type: "registered"; sessionId: string; paneId: string; cwd: string; transcriptPath: string; timestamp: number }
+  | { type: "ended"; sessionId: string; timestamp: number };
 
 // ============================================================================
 // Prompt Patterns
@@ -84,13 +82,25 @@ function log(message: string): void {
 // ============================================================================
 
 /**
+ * Get the tmux command with custom socket if specified
+ */
+function getTmuxCmd(): string {
+  const tmuxSocket = process.env.TMUX;
+  if (tmuxSocket && tmuxSocket.startsWith("tmux -S")) {
+    return tmuxSocket; // Already includes the socket flag
+  }
+  return tmuxSocket ? `tmux -S ${tmuxSocket}` : "tmux";
+}
+
+/**
  * Discover all panes that have opted in (title starts with @tb-)
  */
 function discoverOptedInPanes(): Set<string> {
   const result = new Set<string>();
 
   try {
-    const cmd = `tmux list-panes -a -F '#{pane_id} #{pane_title}'`;
+    const tmuxCmd = getTmuxCmd();
+    const cmd = `${tmuxCmd} list-panes -a -F '#{pane_id} #{pane_title}'`;
     const output = execSync(cmd, { stdio: ["ignore", "pipe", "ignore"] })
       .toString()
       .trim();
@@ -120,7 +130,8 @@ function discoverOptedInPanes(): Set<string> {
  */
 function capturePane(paneId: string): string {
   try {
-    const cmd = `tmux capture-pane -p -t ${paneId}`;
+    const tmuxCmd = getTmuxCmd();
+    const cmd = `${tmuxCmd} capture-pane -p -t ${paneId}`;
     return execSync(cmd, { stdio: ["ignore", "pipe", "ignore"] })
       .toString()
       .trim();
@@ -135,7 +146,8 @@ function capturePane(paneId: string): string {
  */
 function paneExists(paneId: string): boolean {
   try {
-    const cmd = `tmux display -p -t ${paneId} '#{pane_id}'`;
+    const tmuxCmd = getTmuxCmd();
+    const cmd = `${tmuxCmd} display -p -t ${paneId} '#{pane_id}'`;
     const output = execSync(cmd, { stdio: ["ignore", "pipe", "ignore"] })
       .toString()
       .trim();
