@@ -1,37 +1,50 @@
 # Starvation Alert Resolution (tb-29cx)
 
-## Summary
+## Alert Summary
 
-Investigated a "Starvation alert: beads invisible to worker" alert. Found the alert was based on stale data — the system is working correctly.
+Starvation alert was triggered claiming:
+- **Workspace:** default
+- **Total beads:** 40
+- **Open:** 8
+- **In-progress:** 1
+- **Claimed by:** claude-code-glm47-juliet
 
-## Investigation
+The alert stated: "Open beads exist but Pluck found none — possible configuration error."
 
-### Alert Data (Stale)
-- Total beads: 40
-- Open: 8
-- In-progress: 1
+## Investigation Results
 
-### Actual State (2026-07-02)
-- Total beads: 46
-- Open: 1 (`tb-5n9` with labels `deferred, umbrella`)
-- In-progress: 1 (`tb-29cx` - this bead)
+Current actual state as of 2026-07-02:
+- **Total beads:** 46
+- **Open:** 1 (tb-5n9)
+- **In-progress:** 1 (tb-29cx)
+- **Closed:** 44
 
-### Root Cause
+## Root Cause Analysis
 
-The bead worker found no beads because:
-1. The only open bead (`tb-5n9`) has the `deferred` label — correctly signaling "don't work on this yet"
-2. The current bead (`tb-29cx`) was already claimed and in-progress
+The starvation alert was based on **stale data**. The 8 open beads referenced in the alert have since been processed and closed.
 
-The 8 open beads referenced in the alert have since been processed/closed. The alert itself was stale, not a configuration error.
+### Why Pluck Found No Beads
 
-## Actions Taken
+Looking at the actual current state:
+1. **tb-5n9** is the only open bead, and it has the label `deferred` — this correctly signals "don't work on this yet"
+2. **tb-29cx** (this bead) was already claimed and in-progress
 
-1. Verified current bead state via `sqlite3 .beads/beads.db`
-2. Confirmed `tb-5n9` has `deferred` label (correct behavior)
-3. Removed labels: `starvation-alert`, `deferred`, `failure-count:2`
-4. Updated bead notes with resolution findings
-5. Closing bead as resolved
+The `deferred` label on tb-5n9 is intentional and correct — it's a task that should be ignored by workers until it's ready.
 
 ## Conclusion
 
-No configuration error. The bead worker correctly skips `deferred` beads and already-claimed beads. System working as designed.
+**No configuration error — the system is working correctly.**
+
+The starvation alert was simply triggered on stale data that didn't reflect the current bead state. The worker correctly found no workable beads because:
+- The only open bead (tb-5n9) is intentionally deferred
+- The only in-progress bead (tb-29cx) was already claimed
+
+## Resolution
+
+- Confirmed the system is working correctly
+- Removed `deferred`, `failure-count:1`, and `starvation-alert` labels from tb-29cx
+- Closing this bead as resolved
+
+## Action Taken
+
+This bead was an investigation-only task. The resolution is documented here and in the bead notes. No code changes were needed — the system was already functioning correctly.
