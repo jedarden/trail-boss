@@ -762,3 +762,103 @@ This makes `trailboss-start` callable from any session — it always (re)creates
 - `Enter` still performs `switch-client` to the agent session; `prefix+B` restores the split view.
 - `trailboss-preview` does not crash when the target pane_id is stale or absent.
 - All Phase 8 exit criteria remain satisfied.
+
+---
+
+## ADR-1: 2026-07-20 — Run the daemon under `systemd --user`, not a manually-started tmux window
+
+### Context
+
+The "Durability" section of this plan already flagged the choice between two homes for the
+daemon process — its own tmux window (simplest) or `systemd --user` (survives host reboots) —
+and chose the tmux window for v1, explicitly deferring reboot survival as an accepted
+limitation.
+
+An artifact-improvement audit on 2026-07-20 checked the live state of the deployed tool on the
+host it's meant to run on and found the daemon **not running**: no process bound to
+`127.0.0.1:4000`, and no `trail-boss` tmux session exists at all (`tmux list-sessions` shows
+none). This is not the accepted "lost on reboot" limitation — the host has been up 21 days
+(since 2026-06-29) with no intervening reboot, so the daemon went down independently (crash,
+`pkill`, or the window/session being closed) and nothing brought it back.
+
+At the same time, 13 other tmux sessions (`alpha`, `bravo`, `charlie`, `delta`, `echo`,
+`foxtrot`, `golf`, `hotel`, `india`, `juliet`, `kilo`, `lima`, `mike`) are live, running Claude
+Code sessions with Trail Boss's hooks wired globally in `~/.claude/settings.json`. Every
+`Stop`/`PermissionRequest`/`UserPromptSubmit` those sessions fire goes through
+`.claude/trailboss-emit.sh`, which POSTs to the collector and — by design, hooks must exit 0 —
+silently discards the event on failure. So for however long the daemon has been down, this
+fleet of parallel sessions has been producing stuck/unstuck signals into the void, with the
+operator getting no attention-routing at all and no alert that the tool had stopped working.
+(The status-line's inability to distinguish "daemon down" from "queue empty" compounds this —
+tracked separately as a bead referencing this ADR.)
+
+This is exactly the failure mode the tool exists to eliminate, just one layer up: instead of
+manually cycling tmux windows to find a stuck *agent*, the operator would need to manually
+notice that Trail Boss *itself* is stuck, with nothing prompting them to check.
+
+Precedent already exists on this exact host: `telegram-claude-bridge.service`,
+`claude-token-collector.service`, and `agentscribe.service` all run as `systemd --user` units
+(user `coding` has `Linger=yes`), giving them auto-restart and boot survival — and all three
+show `active running` right now. Trail Boss is the only comparable always-on tool still living
+in a hand-launched tmux window.
+
+### Decision
+
+Package the daemon (`daemon/index.ts`, `bun index.ts`) as a `systemd --user` unit,
+`trailboss-daemon.service`, with `Restart=on-failure`, a short `RestartSec`, and
+`WantedBy=default.target` — so it starts at login/boot (linger is already enabled for this
+user) and restarts automatically on crash without anyone needing to notice and re-run
+`trailboss-start`.
+
+`bin/trailboss-start` stops owning the daemon's lifecycle: drop the `pkill -f
+"bun.*trail-boss/daemon/index.ts"` and the `tmux new-session -s trail-boss -n daemon` calls,
+and replace them with `systemctl --user is-active --quiet trailboss-daemon || systemctl --user
+start trailboss-daemon`, then poll `/status` exactly as today before continuing to build the
+`dashboard` window. The TUI + live-preview split is unaffected — it's inherently interactive
+and stays in a tmux window owned by the operator's client.
+
+Daemon stdout/stderr moves from a tmux pane's scrollback to `journalctl --user -u
+trailboss-daemon -f`.
+
+### Alternatives Considered
+
+1. **Status quo (tmux window, manual restart).** This is the state the audit found: dead, with
+   zero alerting, silently dropping events from 13 concurrent sessions. Rejected — it's the
+   problem, not a mitigation.
+2. **System-level `systemd` unit (root, `/etc/systemd/system/`).** The daemon needs to run as
+   `coding` (issues `tmux` commands against `coding`'s tmux server, reads `~/.claude` paths); a
+   user unit already has the right environment for free and matches the pattern of the three
+   other daemons on this host. Rejected as unnecessary extra surface.
+3. **Supervising wrapper loop** (`while true; do bun index.ts; sleep 1; done` inside the tmux
+   window). Still tied to the tmux server/window's own lifetime, still doesn't survive a host
+   reboot, and reimplements what `systemd --user` already provides. Rejected.
+4. **External process manager (pm2, supervisord, etc.)** Adds a new runtime dependency for
+   something `systemd --user` already does natively and consistently with every other daemon on
+   this host. Rejected.
+5. **Document the manual-restart workaround more prominently instead of changing anything.**
+   Doesn't address the actual failure mode observed live (an unnoticed crash/kill with no
+   auto-recovery) — just makes the symptom easier to look up after the fact. Rejected.
+
+### Consequences
+
+- **Fixes the exact gap this audit found live.** Trail Boss self-heals from crashes and host
+  reboots without operator intervention, closing the outage window this audit observed.
+- **Decouples daemon uptime from tmux server/session health.** Today, `bin/trailboss-start`
+  itself tears down the `trail-boss` tmux session (`tmux kill-session -t trail-boss`) and kills
+  the daemon process (`pkill -f bun.*daemon/index.ts`) on every invocation as part of its "start
+  fresh" logic — meaning re-running the launcher, or any stray `tmux kill-session`/`pkill`
+  matching that pattern, currently takes the daemon down with it. After this change, restarting
+  the dashboard no longer implies restarting the daemon.
+- **`bin/trailboss-start` becomes idempotent** — safe to re-run to reattach the dashboard
+  without disturbing a healthy daemon or its in-flight queue state.
+- **Cost:** one more unit file to maintain
+  (`~/.config/systemd/user/trailboss-daemon.service`) and a one-time migration (install +
+  enable the unit, stop relying on the tmux-window convention).
+- **Workflow change:** daemon logs move from `tmux attach -t trail-boss` scrollback to
+  `journalctl --user -u trailboss-daemon`. Same tradeoff already accepted for the three
+  precedent services on this host; not a new pattern to learn.
+- **The reconcile loop's transcript-rebuild-on-restart behavior (already implemented, exercised
+  by acceptance scenario AS-4) becomes the tested backstop for the daemon's brief restart
+  window** — this ADR doesn't require a new invariant, it finishes wiring the durability story
+  the plan already designed for. Hardening the client side (bounded local retry for dropped
+  POSTs during that window) is filed as a follow-on bead referencing this ADR.
