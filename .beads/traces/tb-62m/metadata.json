@@ -1,16 +1,16 @@
 {
-  "bead_id": "tb-4mq",
-  "agent": "claude-sonnet",
+  "bead_id": "tb-62m",
+  "agent": "claude-code-glm47",
   "provider": "anthropic",
-  "model": "claude-sonnet-4-6",
+  "model": "glm-4.7",
   "exit_code": 0,
   "outcome": "success",
-  "duration_ms": 276,
+  "duration_ms": 467173,
   "input_tokens": null,
   "output_tokens": null,
   "cost_usd": null,
-  "captured_at": "2026-05-30T16:55:36.565265136Z",
+  "captured_at": "2026-07-02T23:47:12.289035229Z",
   "trace_format": "claude_json",
-  "pruned": true,
+  "pruned": false,
   "template_version": null
 }
