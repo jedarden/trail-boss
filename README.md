@@ -205,14 +205,40 @@ Add to your project's `.claude/settings.json`:
 }
 ```
 
-### 3. Start Trail Boss
+### 3. Enable and start the daemon via systemd
+
+```bash
+# Create the systemd service (one-time setup)
+cat > ~/.config/systemd/user/trailboss-daemon.service <<'EOF'
+[Unit]
+Description=Trail Boss daemon
+After=default.target
+
+[Service]
+WorkingDirectory=/home/coding/trail-boss/daemon
+ExecStart=$(which bun) index.ts
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=default.target
+EOF
+
+# Enable and start the service
+systemctl --user daemon-reload
+systemctl --user enable --now trailboss-daemon
+```
+
+The daemon runs as a systemd user service and automatically restarts on failure.
+
+### 4. Start the Trail Boss dashboard
 
 ```bash
 bin/trailboss-start
 ```
 
-This creates (or reuses) a `trail-boss` tmux session with two windows: `daemon` and
-`dashboard`. The dashboard shows the TUI on top (60%) and a live pane preview below (40%).
+This creates (or reuses) a `trail-boss` tmux session with the `dashboard` window.
+The dashboard shows the TUI on top (60%) and a live pane preview below (40%).
 
 ### 4. Navigate
 

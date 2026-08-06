@@ -35,7 +35,22 @@ The goal of Phase 8 is to replace the bash `bin/trailboss-watch` script with a p
 
 The TUI goes in `tui/` as a Go module (separate from the Bun daemon).
 
-## Running the Daemon (for testing)
+## Running the Daemon
+
+The daemon runs as a systemd user service for automatic restart on failure:
+
+```bash
+# Enable and start (one-time setup)
+systemctl --user enable --now trailboss-daemon
+
+# Check status
+systemctl --user status trailboss-daemon
+
+# View logs
+journalctl --user -u trailboss-daemon -f
+```
+
+For testing/debugging, you can also run the daemon directly:
 
 ```bash
 cd daemon && bun index.ts
