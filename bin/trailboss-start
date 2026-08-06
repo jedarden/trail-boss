@@ -10,15 +10,10 @@ if [ -z "$TMUX" ]; then
   exit 1
 fi
 
-# Kill any existing trail-boss session and daemon process, then start fresh.
-# Killing the daemon window when it's the session's last window auto-destroys
-# the session, so it's simpler to tear down the whole session at once.
-pkill -f "bun.*trail-boss/daemon/index.ts" 2>/dev/null || true
-tmux kill-session -t trail-boss 2>/dev/null || true
-sleep 0.5
-
-# Create a fresh session with the daemon as its first (and only) window
-tmux new-session -d -s trail-boss -n daemon -c "$TB_DIR/daemon" "bun index.ts"
+# Ensure the daemon is running via systemd
+if ! systemctl --user is-active --quiet trailboss-daemon; then
+  systemctl --user start trailboss-daemon
+fi
 
 # Wait for daemon to be ready
 for i in $(seq 1 15); do
@@ -30,7 +25,7 @@ done
 
 if ! curl -s --max-time 1 "http://127.0.0.1:4000/status" >/dev/null 2>&1; then
   echo "trailboss-start: daemon failed to start" >&2
-  tmux select-window -t trail-boss:daemon 2>/dev/null || true
+  systemctl --user status trailboss-daemon
   exit 1
 fi
 
