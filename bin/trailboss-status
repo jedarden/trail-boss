@@ -6,19 +6,39 @@ DAEMON_URL="${TRAILBOSS_URL:-http://127.0.0.1:4000}"
 # Fetch status from daemon (timeout 100ms for responsiveness)
 STATUS=$(curl -s --max-time 0.1 "$DAEMON_URL/status" 2>/dev/null || echo '{"stuckCount":-1}')
 
-# Extract count using python3 for reliable parsing
+# Extract count and state using python3 for reliable parsing
 RESULT=$(python3 -c "
 import json, sys
 try:
     data = json.load(sys.stdin)
     count = data.get('stuckCount', -1)
-    if count > 0:
-        print(count)
+    # Output state and count as colon-separated values
+    if count == -1:
+        print('down')
+    elif count > 0:
+        print(f'stuck:{count}')
+    else:
+        print('ok')
 except:
-    pass
+    print('down')
 " <<< "$STATUS")
 
-# Output with warning icon if stuck, empty otherwise
-if [ -n "$RESULT" ] && [ "$RESULT" != "0" ]; then
-  echo "⚠ $RESULT"
-fi
+# Render appropriate glyph and color based on state
+STATE="${RESULT%%:*}"  # Extract part before colon (if any)
+COUNT="${RESULT#*:}"   # Extract part after colon (if any)
+
+case "$STATE" in
+  down)
+    # Daemon unreachable - render red error indicator
+    echo '#[fg=colour196,bold]✗ down#[default]'
+    ;;
+  stuck)
+    # Stuck sessions - render warning with count
+    echo "#[fg=colour226,bold]⚠ $COUNT#[default]"
+    ;;
+  ok)
+    # Healthy and empty - optional: render success indicator (currently blank)
+    # Uncomment to show "✓" for healthy state:
+    # echo '#[fg=colour76,bold]✓#[default]'
+    ;;
+esac
