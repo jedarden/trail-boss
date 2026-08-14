@@ -1,0 +1,6 @@
+run_number,status,exit_code,duration_seconds,notes
+1,FAIL,1,52,"False negative: pane not detected as stuck"
+2,FAIL,1,53,"False negative: pane not detected as stuck"
+3,FAIL,1,52,"False negative: pane not detected as stuck"
+4,FAIL,1,53,"False negative: pane not detected as stuck"
+5,FAIL,1,53,"False negative: pane not detected as stuck"
