@@ -1,0 +1,75 @@
+{
+  "test_name": "tmux-detector-acceptance",
+  "timestamp": "20260702-190515",
+  "num_runs": 5,
+  "runs": [
+    {
+      "timestamp": "2026-07-02T19:05:15-04:00",
+      "run_number": 1,
+      "result": "fail",
+      "duration_seconds": 34,
+      "exit_code": 1,
+      "false_positive": false,
+      "false_negative": false,
+      "failure_type": "unknown",
+      "error_message": "Unknown failure - exit code 1",
+      "log_file": "tmux-detector-run20260702-190515-1.log"
+    },
+    {
+      "timestamp": "2026-07-02T19:05:51-04:00",
+      "run_number": 2,
+      "result": "fail",
+      "duration_seconds": 35,
+      "exit_code": 1,
+      "false_positive": false,
+      "false_negative": false,
+      "failure_type": "unknown",
+      "error_message": "Unknown failure - exit code 1",
+      "log_file": "tmux-detector-run20260702-190515-2.log"
+    },
+    {
+      "timestamp": "2026-07-02T19:06:28-04:00",
+      "run_number": 3,
+      "result": "fail",
+      "duration_seconds": 34,
+      "exit_code": 1,
+      "false_positive": false,
+      "false_negative": false,
+      "failure_type": "unknown",
+      "error_message": "Unknown failure - exit code 1",
+      "log_file": "tmux-detector-run20260702-190515-3.log"
+    },
+    {
+      "timestamp": "2026-07-02T19:07:04-04:00",
+      "run_number": 4,
+      "result": "fail",
+      "duration_seconds": 35,
+      "exit_code": 1,
+      "false_positive": false,
+      "false_negative": false,
+      "failure_type": "unknown",
+      "error_message": "Unknown failure - exit code 1",
+      "log_file": "tmux-detector-run20260702-190515-4.log"
+    },
+    {
+      "timestamp": "2026-07-02T19:07:41-04:00",
+      "run_number": 5,
+      "result": "fail",
+      "duration_seconds": 34,
+      "exit_code": 1,
+      "false_positive": false,
+      "false_negative": false,
+      "failure_type": "unknown",
+      "error_message": "Unknown failure - exit code 1",
+      "log_file": "tmux-detector-run20260702-190515-5.log"
+    }
+  ],
+  "summary": {
+    "total_runs": 5,
+    "passed": 0,
+    "failed": 5,
+    "success_rate": 0.0,
+    "average_duration": 34.4,
+    "total_duration": 172
+  }
+}

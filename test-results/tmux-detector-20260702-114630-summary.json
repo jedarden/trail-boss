@@ -1,0 +1,8 @@
+{
+  "test": "tmux-detector-acceptance",
+  "status": "fail",
+  "exit_code": 1,
+  "duration_seconds": 52,
+  "timestamp": "20260702-114630",
+  "output_file": "./test-results/tmux-detector-20260702-114630.log"
+}

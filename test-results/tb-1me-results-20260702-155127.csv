@@ -1,0 +1,6 @@
+run_number,status,exit_code,duration_seconds,notes
+1,FAIL,1,55,"False negative: session not unstuck after activity"
+2,FAIL,1,55,"False negative: session not unstuck after activity"
+3,FAIL,1,54,"False negative: session not unstuck after activity"
+4,FAIL,1,55,"False negative: session not unstuck after activity"
+5,FAIL,1,55,"False negative: session not unstuck after activity"
