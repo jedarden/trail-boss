@@ -61,8 +61,116 @@ case "$1" in
     tmux switch-client -t trail-boss:dashboard
     ;;
 
+  doctor)
+    # Healthcheck for Trail Boss installation and runtime state
+    FAILED=0
+
+    echo "Trail Boss Doctor"
+    echo "=================="
+    echo
+
+    # 1. Daemon reachable
+    echo -n "✓ Daemon reachable: "
+    if curl -s --max-time 2 "$DAEMON_URL/status" >/dev/null 2>&1; then
+      echo "OK"
+    else
+      echo "FAIL"
+      echo "  → Daemon not responding at $DAEMON_URL"
+      echo "  → Fix: Run 'bin/trailboss-start' or 'systemctl --user start trailboss-daemon'"
+      FAILED=1
+    fi
+
+    # 2. Daemon process/service healthy
+    echo -n "✓ Daemon process healthy: "
+    if systemctl --user is-active --quiet trailboss-daemon 2>/dev/null; then
+      echo "OK (systemd)"
+    elif tmux list-sessions 2>/dev/null | grep -q "^trail-boss:"; then
+      # Check for daemon window in trail-boss session
+      if tmux list-windows -t trail-boss 2>/dev/null | grep -q "daemon"; then
+        echo "OK (tmux)"
+      else
+        echo "FAIL"
+        echo "  → trail-boss tmux session exists but no daemon window found"
+        echo "  → Fix: Run 'bin/trailboss-start'"
+        FAILED=1
+      fi
+    else
+      echo "FAIL"
+      echo "  → No systemd service or trail-boss tmux session found"
+      echo "  → Fix: Run 'bin/trailboss-start' or 'systemctl --user start trailboss-daemon'"
+      FAILED=1
+    fi
+
+    # 3. trailboss-tui binary present
+    echo -n "✓ trailboss-tui binary: "
+    if [ -x "$TB_DIR/bin/trailboss-tui" ]; then
+      echo "OK"
+    else
+      echo "FAIL"
+      echo "  → Binary not found or not executable: $TB_DIR/bin/trailboss-tui"
+      echo "  → Fix: Build the TUI with 'cd tui && go build -o ../bin/trailboss-tui'"
+      FAILED=1
+    fi
+
+    # 4. Hooks wired
+    echo -n "✓ Claude Code hooks wired: "
+    SETTINGS_FILE="$HOME/.claude/settings.json"
+    EMITTER_PATH="$TB_DIR/.claude/trailboss-emit.sh"
+
+    if [ ! -f "$SETTINGS_FILE" ]; then
+      echo "FAIL"
+      echo "  → Claude settings file not found: $SETTINGS_FILE"
+      echo "  → Fix: Ensure Claude Code is installed and has been run at least once"
+      FAILED=1
+    else
+      MISSING_HOOKS=0
+      for hook in Stop PermissionRequest UserPromptSubmit SessionStart SessionEnd; do
+        if ! grep -q "\"$hook\"" "$SETTINGS_FILE" || \
+           ! grep -A5 "\"$hook\"" "$SETTINGS_FILE" | grep -q "$EMITTER_PATH"; then
+          MISSING_HOOKS=1
+          break
+        fi
+      done
+
+      if [ $MISSING_HOOKS -eq 0 ]; then
+        echo "OK"
+      else
+        echo "FAIL"
+        echo "  → Not all required hooks are pointing to $EMITTER_PATH"
+        echo "  → Required hooks: Stop, PermissionRequest, UserPromptSubmit, SessionStart, SessionEnd"
+        echo "  → Fix: Add hook entries to $SETTINGS_FILE for each event"
+        FAILED=1
+      fi
+    fi
+
+    # 5. tmux.conf keybindings loaded
+    echo -n "✓ tmux keybindings loaded: "
+    if [ -z "$TMUX" ]; then
+      echo "SKIP (not in tmux)"
+    else
+      # Check if the keybindings are defined
+      if tmux list-keys 2>/dev/null | grep -q "trailboss jump-next\|trailboss skip\|trailboss popup"; then
+        echo "OK"
+      else
+        echo "FAIL"
+        echo "  → Trail Boss keybindings not found in current tmux server"
+        echo "  → Fix: Run 'tmux source-file $TB_DIR/tmux.conf' from within tmux"
+        FAILED=1
+      fi
+    fi
+
+    echo
+    if [ $FAILED -eq 0 ]; then
+      echo "All checks passed ✓"
+      exit 0
+    else
+      echo "Some checks failed ✗"
+      exit 1
+    fi
+    ;;
+
   *)
-    echo "Usage: trailboss {jump-next|skip|popup|return}" >&2
+    echo "Usage: trailboss {jump-next|skip|popup|return|doctor}" >&2
     exit 1
     ;;
 esac
