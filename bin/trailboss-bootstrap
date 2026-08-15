@@ -1,10 +1,11 @@
 #!/bin/bash
 # Bootstrap Trail Boss with all currently-idle Claude Code panes.
-# Scans tmux for panes running `claude`, injects a synthetic Stop event
-# for any not already in the queue. Uses pane_id as session_id.
-# When real hooks fire, the daemon replaces these synthetic entries.
+# Scans tmux for panes running `claude`, checks if they're actually quiet/stuck,
+# then injects a synthetic Stop event for any not already in the queue.
+# Uses pane_id as session_id. When real hooks fire, the daemon replaces these synthetic entries.
 
 DAEMON_URL="${TRAILBOSS_URL:-http://127.0.0.1:4000}"
+QUIET_THRESHOLD_MS="${TRAILBOSS_QUIET_THRESHOLD_MS:-30000}"
 
 if ! curl -s --max-time 1 "$DAEMON_URL/status" >/dev/null 2>&1; then
   echo "trailboss-bootstrap: daemon not running" >&2
@@ -21,11 +22,78 @@ for item in d.get('items', []):
 
 INJECTED=0
 SKIPPED=0
+ACTIVE=0
+
+# Hash output for comparison (same logic as tmux-detector.ts)
+hash_output() {
+  local output="$1"
+  [ -z "$output" ] && echo "" && return
+
+  local first_line last_line line_count
+  first_line=$(echo "$output" | head -n 1)
+  last_line=$(echo "$output" | tail -n 1)
+  line_count=$(echo "$output" | wc -l)
+
+  echo "${#first_line}-${#last_line}-${line_count}-${first_line:0:10}-${last_line: -10}"
+}
+
+# Check if last line looks like a prompt (same patterns as tmux-detector.ts)
+looks_like_prompt() {
+  local output="$1"
+  local last_line
+  last_line=$(echo "$output" | tail -n 1 | grep -oE '[^[:space:]].*[[:space:]]*$' | sed 's/[[:space:]]*$//')
+
+  # Prompt patterns from tmux-detector.ts
+  for pattern in '$' '>' '#' '?' '\[.*\]' ':' '>>>' '\.\.\.' '>' '@'; do
+    case "$last_line" in
+      *"$pattern") return 0 ;;
+    esac
+  done
+
+  return 1
+}
+
+# Check if a pane is actually quiet/stuck
+is_pane_stuck() {
+  local pane_id="$1"
+
+  # Capture current output
+  local current_output current_hash
+  current_output=$(tmux capture-pane -p -t "$pane_id" 2>/dev/null)
+  current_hash=$(hash_output "$current_output")
+
+  # Wait for quiet threshold
+  sleep "$((QUIET_THRESHOLD_MS / 1000))"
+
+  # Capture again and compare
+  local second_output second_hash
+  second_output=$(tmux capture-pane -p -t "$pane_id" 2>/dev/null)
+  second_hash=$(hash_output "$second_output")
+
+  # If output changed, pane is active
+  if [ "$current_hash" != "$second_hash" ]; then
+    return 1
+  fi
+
+  # Output unchanged — check if looks like prompt
+  if looks_like_prompt "$second_output"; then
+    return 0
+  fi
+
+  # Not a prompt, assume still working
+  return 1
+}
 
 while IFS=: read -r pane_id pane_pid session_name; do
   # Skip if already in queue
   if echo "$QUEUED_PANES" | grep -qF "$pane_id"; then
     SKIPPED=$((SKIPPED + 1))
+    continue
+  fi
+
+  # Check if pane is actually stuck (quiet + prompt-like)
+  if ! is_pane_stuck "$pane_id"; then
+    ACTIVE=$((ACTIVE + 1))
     continue
   fi
 
@@ -51,4 +119,4 @@ done < <(tmux list-panes -a -F '#{pane_id}:#{pane_pid}:#{session_name}' \
              [ "$cmd" = "claude" ] && echo "$pane_id:$pane_pid:$session_name"
            done)
 
-echo "trailboss-bootstrap: injected $INJECTED pane(s), skipped $SKIPPED already-queued"
+echo "trailboss-bootstrap: injected $INJECTED stuck pane(s), $ACTIVE active, $SKIPPED already-queued"
