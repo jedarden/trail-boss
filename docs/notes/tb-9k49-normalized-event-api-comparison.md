@@ -190,7 +190,7 @@ if (headers["x-event-source"] === "claude-hooks") {
 - Type guards: `daemon/claude-adapter.ts` (lines 76-98)
 - Emitters: 
   - Claude hooks: `.claude/trailboss-emit.sh`
-  - Tmux detector: `daemon/tmux-adapter.ts`
+  - Tmux detector: `daemon/tmux-detector.ts`
 
 ### When to Use Option 2 Instead
 
