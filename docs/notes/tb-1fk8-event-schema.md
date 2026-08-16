@@ -218,7 +218,7 @@ This schema is consistent with the TypeScript interfaces in `daemon/types.ts`:
 - TypeScript types in `daemon/types.ts`
 - Endpoint `/event/normalized` in `daemon/index.ts`
 - Full schema documentation in `docs/notes/normalized-event-schema.md`
-- Tmux detector emits normalized events (see `daemon/tmux-adapter.ts`)
+- Tmux detector emits normalized events (see `daemon/tmux-detector.ts`)
 
 ---
 

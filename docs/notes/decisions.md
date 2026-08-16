@@ -93,7 +93,7 @@ All normalized events share a common structure with a `type` discriminator:
 
 **How tmux detector submits events:**
 
-The tmux detector (`daemon/tmux-adapter.ts`) emits normalized events to the daemon:
+The tmux detector (`daemon/tmux-detector.ts`) emits normalized events to the daemon:
 
 - **Endpoint:** `POST http://127.0.0.1:4000/event/normalized`
 - **Content-Type:** `application/json`
@@ -143,11 +143,11 @@ The `/event/normalized` endpoint **is the normalized event contract** that isola
 
 The adapter seam is validated:
 - **Claude Code adapter** (`daemon/claude-adapter.ts`): Converts `Stop`/`PermissionRequest` hook payloads → normalized events → POST to `/event/normalized`
-- **Tmux detector adapter** (`daemon/tmux-adapter.ts`): Emits normalized events directly from tmux polling → POST to `/event/normalized`
+- **Tmux detector** (`daemon/tmux-detector.ts`): Emits normalized events directly from tmux polling → POST to `/event/normalized`
 
 **Implementation status:** ✅ Complete
 
-The `/event/normalized` endpoint is implemented in `daemon/index.ts` (lines 99-177) and handles all four event types. The Claude Code adapter (`daemon/claude-adapter.ts`) and tmux detector (`daemon/tmux-adapter.ts`) both emit normalized events to this endpoint.
+The `/event/normalized` endpoint is implemented in `daemon/index.ts` (lines 99-177) and handles all four event types. The Claude Code adapter (`daemon/claude-adapter.ts`) and tmux detector (`daemon/tmux-detector.ts`) both emit normalized events to this endpoint.
 
 ### Hooks, not polling
 
@@ -305,6 +305,19 @@ bun run daemon/tmux-detector.ts > ~/.local/share/trailboss/tmux-detector.log 2>&
 The tmux detector successfully answers Open question 1: **Yes, a purely tmux-level detector is viable as a universal fallback**. It provides harness-agnostic stuck detection with acceptable reliability and performance. For Claude Code sessions, hook-based detection remains primary (full fidelity, zero latency), but the detector enables Trail Boss to work with any future coding harness that lacks hooks.
 
 The adapter seam is validated: the daemon consumes normalized events from either source (hooks or detector) without distinction. Switching remains tmux-level and harness-agnostic.
+
+## Canonical tmux detector (2026-08-15)
+
+The repository previously contained multiple tmux-level detector prototypes. The canonical
+implementation is `daemon/tmux-detector.ts`, launched by `bin/trailboss-tmux-detector`, with
+the `@tb-` pane-title opt-in and `test-tmux-detector.sh` as its lifecycle acceptance test.
+
+The unused Go prototype, the superseded TypeScript adapter, its watch wrapper, and their
+Go-specific acceptance scripts were removed. None was launched by the supported CLI or
+included in the documented setup, and the prototypes used a different opt-in contract. Keeping
+them would leave contributors unsure which detector to run and would preserve unmaintained,
+undocumented alternatives. Future tmux-detector changes should target the canonical TypeScript
+implementation.
 
 ## Test Results (2026-07-02)
 

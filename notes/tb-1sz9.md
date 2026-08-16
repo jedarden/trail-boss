@@ -6,9 +6,7 @@ Completed the tmux-level stuck detector poller implementation. The detector watc
 
 ## Implementation
 
-Two implementations exist:
-
-### 1. TypeScript Implementation (Primary)
+The canonical implementation is TypeScript:
 
 **Location:** `daemon/tmux-detector.ts`
 
@@ -47,34 +45,9 @@ const PROMPT_PATTERNS = [
 bun run daemon/tmux-detector.ts
 ```
 
-### 2. Go Implementation (Alternative)
-
-**Location:** `daemon/tmux-adapter/`
-
-**Files:**
-- `main.go` - Entry point (added in this bead)
-- `detector.go` - Detector logic and poll loop
-- `tmux.go` - Tmux utilities (pane discovery, capture, CWD)
-- `client.go` - HTTP client for posting events
-- `types.go` - Event types and constants
-
-**Key features:**
-- Same detection logic as TypeScript version
-- Uses `@trailboss-monitor` pane option for opt-in (different from TypeScript version)
-- 2-second poll interval, 10-second stuck threshold
-- SHA256 content hashing for change detection
-- Graceful shutdown
-
-**Building:**
-```bash
-cd daemon/tmux-adapter
-go build -o trailboss-tmux-detector .
-```
-
-**Opt-in mechanism (Go version):**
-```bash
-tmux set-option -p @trailboss-monitor 1
-```
+The earlier Go prototype was retired on 2026-08-15. It had no supported launcher or build
+target, was not part of the documented setup, and used a separate `@trailboss-monitor` pane
+option. The TypeScript detector is the only supported tmux detector.
 
 ## Acceptance Criteria
 
@@ -145,11 +118,8 @@ The detector emits events to `POST /event/normalized`:
 - `docs/notes/normalized-event-schema.md` - Event schema documentation
 - `docs/notes/tmux-detector-submission-contract.md` - Event submission contract
 
-## Files Changed
-
-- `daemon/tmux-adapter/main.go` - Added (Go entry point)
-- `daemon/tmux-adapter/tmux.go` - Fixed (removed unused `time` import)
-
 ## Notes
 
-The TypeScript implementation is the primary and recommended detector. The Go implementation exists as an alternative but uses a different opt-in mechanism (tmux user option vs pane title prefix). For consistency, the TypeScript version should be preferred.
+The normalized event contract and acceptance coverage remain provided by the TypeScript
+implementation. For consistency, future detector work should use its pane-title opt-in and
+configuration environment variables.

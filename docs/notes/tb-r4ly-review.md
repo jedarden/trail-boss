@@ -148,7 +148,7 @@ Queue operations (upsertSession, enqueue, dequeue)
 ### Path B: Tmux Detector (New)
 
 ```
-Tmux Adapter (daemon/tmux-adapter.ts)
+Tmux Detector (daemon/tmux-detector.ts)
     ↓ (polls pane output, detects stuck state)
 Emit normalized event
     ↓ (POST to /event/normalized)
@@ -164,9 +164,9 @@ Queue operations (same as Path A)
 
 ---
 
-## 5. How Tmux Adapter Works
+## 5. How Tmux Detector Works
 
-**Location:** `daemon/tmux-adapter.ts`
+**Location:** `daemon/tmux-detector.ts`
 
 **Detection logic:**
 1. **Discovery**: Polls `tmux list-panes -a` for panes with `@tb-` prefix in title

@@ -68,7 +68,7 @@ Run acceptance tests and record viability verdict for the tmux-level stuck detec
 ## Documentation
 
 - **Full findings**: `docs/notes/decisions.md` — "Tmux Detector Viability" and "Final Viability Confirmation"
-- **Acceptance test**: `test-tmux-detector-acceptance.sh`
+- **Acceptance test**: `test-tmux-detector.sh`
 - **Test results**: `/home/coding/trail-boss/test-results/` (various CSV and JSON files)
 
 ---
