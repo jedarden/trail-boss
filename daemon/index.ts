@@ -1,13 +1,110 @@
 // Trail Boss daemon: ingest endpoint, state, queue, reconcile loop
 import * as http from "http";
+import * as fs from "fs";
+import * as path from "path";
+import { fileURLToPath } from "url";
 import type { HookEvent, NormalizedEvent } from "./types.ts";
 import { adaptHookEvent, isStuckEvent, isUnstuckEvent, isSessionRegistered, isSessionEnded } from "./claude-adapter.ts";
-import { upsertSession, deleteSession, enqueue, dequeue, dequeueByPaneId, skipHead, getHead, getStuckCount, getAllStuck, cleanupQueue } from "./db.ts";
+import { upsertSession, deleteSession, enqueue, dequeue, dequeueByPaneId, skipHead, getHead, getStuckCount, getAllStuck, cleanupQueue, getSession } from "./db.ts";
 import { startReconcileLoop, reconcileStuckDirection } from "./reconcile.ts";
+import { startNotificationChecker } from "./notify.ts";
+import { execSync } from "child_process";
 
 const PORT = 4000;
 const HOST = "127.0.0.1"; // Loopback only
 const SKIP_COOLDOWN_MS = 30_000; // 30 seconds
+const AUTO_JUMP_ENABLED = process.env.TRAILBOSS_AUTO_JUMP === "1";
+const SPOOL_FILE = path.join(path.dirname(fileURLToPath(import.meta.url)), "../../.trailboss-spool.jsonl");
+
+// Replay spooled events from client-side failures during daemon restart
+function replaySpool(): { replayed: number; failed: number } {
+  if (!fs.existsSync(SPOOL_FILE)) {
+    return { replayed: 0, failed: 0 };
+  }
+
+  const content = fs.readFileSync(SPOOL_FILE, "utf-8");
+  const lines = content.trim().split("\n").filter(line => line.length > 0);
+
+  if (lines.length === 0) {
+    fs.unlinkSync(SPOOL_FILE);
+    return { replayed: 0, failed: 0 };
+  }
+
+  let replayed = 0;
+  let failed = 0;
+
+  for (const line of lines) {
+    // Spool format: "TIMESTAMP PANE_ID JSON_PAYLOAD"
+    // Extract the first two fields and treat the rest as JSON
+    const spaceIndex1 = line.indexOf(" ");
+    const spaceIndex2 = line.indexOf(" ", spaceIndex1 + 1);
+
+    if (spaceIndex1 === -1 || spaceIndex2 === -1) {
+      console.error(`[spool] malformed line, skipping: ${line.slice(0, 50)}...`);
+      failed++;
+      continue;
+    }
+
+    const timestamp = line.slice(0, spaceIndex1);
+    const paneId = line.slice(spaceIndex1 + 1, spaceIndex2);
+    const payload = line.slice(spaceIndex2 + 1);
+
+    try {
+      const raw: HookEvent = JSON.parse(payload);
+      const event = adaptHookEvent(raw, paneId);
+
+      // Process the event exactly as if it were a fresh POST
+      if (isStuckEvent(event)) {
+        if (event.sessionId !== event.paneId) {
+          dequeueByPaneId(event.paneId, event.sessionId);
+        }
+        upsertSession(
+          event.sessionId,
+          event.paneId,
+          event.cwd,
+          event.transcriptPath,
+          event.timestamp,
+          event.reason,
+          event.message
+        );
+        enqueue(event.sessionId, event.reason, event.timestamp);
+        console.log(`[spool] stuck: ${event.sessionId.slice(0, 8)} (${event.reason})`);
+      } else if (isUnstuckEvent(event)) {
+        dequeue(event.sessionId);
+        dequeueByPaneId(event.paneId, event.sessionId);
+        console.log(`[spool] unstuck: ${event.sessionId.slice(0, 8)}`);
+      } else if (isSessionRegistered(event)) {
+        upsertSession(
+          event.sessionId,
+          event.paneId,
+          event.cwd,
+          event.transcriptPath,
+          null,
+          null,
+          null
+        );
+        console.log(`[spool] registered: ${event.sessionId.slice(0, 8)} -> ${event.paneId}`);
+      } else if (isSessionEnded(event)) {
+        deleteSession(event.sessionId);
+        console.log(`[spool] ended: ${event.sessionId.slice(0, 8)}`);
+      }
+
+      replayed++;
+    } catch (err) {
+      console.error(`[spool] failed to replay event: ${err}`);
+      failed++;
+    }
+  }
+
+  // Remove spool file after replay attempt (whether successful or not)
+  try {
+    fs.unlinkSync(SPOOL_FILE);
+  } catch {
+    // Ignore errors removing the spool file
+  }
+
+  return { replayed, failed };
+}
 
 // Run stuck-direction reconcile on startup to recover sessions that became stuck while daemon was down
 console.log("[startup] running stuck-direction reconcile...");
@@ -18,11 +115,23 @@ if (stuckResult.enqueued > 0) {
   console.log(`[startup] no stuck sessions recovered from transcripts (${stuckResult.checked} checked)`);
 }
 
+// Replay any spooled events from client-side hook failures during restart
+console.log("[startup] replaying spooled events...");
+const spoolResult = replaySpool();
+if (spoolResult.replayed > 0) {
+  console.log(`[startup] replayed ${spoolResult.replayed} spooled events (${spoolResult.failed} failed)`);
+} else {
+  console.log(`[startup] no spooled events to replay`);
+}
+
 // Start reconcile loop (runs every 5s by default)
 startReconcileLoop(5000);
 
 // Cleanup old queue entries hourly
 setInterval(() => cleanupQueue(), 60 * 60 * 1000);
+
+// Start notification checker (sends alerts when queue depth crosses threshold)
+startNotificationChecker();
 
 const server = http.createServer(async (req, res) => {
   const url = new URL(req.url || "", `http://${req.headers.host}`);
@@ -72,9 +181,14 @@ const server = http.createServer(async (req, res) => {
         console.log(`[event] stuck: ${event.sessionId.slice(0, 8)} (${event.reason})`);
       } else if (isUnstuckEvent(event)) {
         // Dequeue by session_id; also clean up any bootstrap entry for this pane
+        const sess = getSession(event.sessionId);
         dequeue(event.sessionId);
         dequeueByPaneId(event.paneId, event.sessionId);
         console.log(`[event] unstuck: ${event.sessionId.slice(0, 8)}`);
+        // Auto-jump if enabled and this was the operator's current pane
+        if (sess) {
+          maybeAutoJump(sess.pane_id);
+        }
       } else if (isSessionRegistered(event)) {
         upsertSession(
           event.sessionId,
@@ -149,8 +263,13 @@ const server = http.createServer(async (req, res) => {
         enqueue(event.sessionId, event.reason, event.timestamp);
         console.log(`[normalized] stuck: ${event.sessionId.slice(0, 8)} (${event.reason})`);
       } else if (event.type === "unstuck") {
+        const sess = getSession(event.sessionId);
         dequeue(event.sessionId);
         console.log(`[normalized] unstuck: ${event.sessionId.slice(0, 8)}`);
+        // Auto-jump if enabled and this was the operator's current pane
+        if (sess) {
+          maybeAutoJump(sess.pane_id);
+        }
       } else if (event.type === "registered") {
         upsertSession(
           event.sessionId,
@@ -257,6 +376,47 @@ async function getStoredSession(sessionId: string): Promise<{ session_id: string
   const { db } = await import("./db.ts");
   const stmt = db.prepare("SELECT session_id, pane_id FROM sessions WHERE session_id = ?");
   return stmt.get(sessionId) as ReturnType<typeof getStoredSession>;
+}
+
+// Auto-jump on resolve: if the operator's current pane just resolved and there's a next item, jump to it
+function maybeAutoJump(resolvedPaneId: string): void {
+  if (!AUTO_JUMP_ENABLED) {
+    return;
+  }
+
+  try {
+    // Get the operator's current attached pane
+    const currentPane = execSync("tmux display -p '#{pane_id}'", { encoding: "utf-8" }).trim();
+
+    // Only auto-jump if the operator was attached to the pane that just resolved
+    if (currentPane !== resolvedPaneId) {
+      return;
+    }
+
+    // Check if there's a next item in the queue
+    const head = getHead();
+    if (!head) {
+      return; // Queue is empty, nothing to jump to
+    }
+
+    const sess = getSession(head.session_id);
+    if (!sess) {
+      return; // Session not found, shouldn't happen due to FK
+    }
+
+    // Perform the jump: switch-client, select-window, select-pane
+    const sessionName = execSync(`tmux display -p -t '${sess.pane_id}' '#{session_name}'`, { encoding: "utf-8" }).trim();
+    if (!sessionName) {
+      console.log(`[auto-jump] pane ${sess.pane_id} not found`);
+      return;
+    }
+
+    execSync(`tmux switch-client -t '${sessionName}' \\; select-window -t '${sess.pane_id}' \\; select-pane -t '${sess.pane_id}'`, { encoding: "utf-8" });
+    console.log(`[auto-jump] ${resolvedPaneId} resolved → ${sess.pane_id}`);
+  } catch (err) {
+    // Don't crash the daemon on tmux errors (e.g., no server, detached client)
+    console.error("[auto-jump] failed:", err);
+  }
 }
 
 server.listen(PORT, HOST, () => {

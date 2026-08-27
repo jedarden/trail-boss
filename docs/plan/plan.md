@@ -657,14 +657,19 @@ The origin file (`/tmp/trailboss-origin`) is written before every jump so `prefi
 
 **Open**
 
-1. **Auto-advance residual** — the trigger, jump model, and keybindings are specified (see
-   "Switching & keybindings": Next/Popup/Skip keys, operator-initiated jump, manual tmux nav is
-   orthogonal). The only residual is whether to offer an opt-in "auto-jump on resolve" toggle —
-   decide after the walking skeleton.
+(None)
 
 **Resolved (recorded so they don't get re-litigated)**
 
-~~1. **Harness layering / adapter contract** — define the normalized stuck/unstuck event the daemon consumes, so detection stays isolated to a per-harness adapter. Is a purely tmux-level detector (no hooks) viable as a universal fallback for future harnesses?~~ **RESOLVED (2026-07-02):** Yes, a purely tmux-level detector is viable as a universal fallback. Implemented in `daemon/tmux-detector.ts` with opt-in via `@tb-` pane title prefix, 30s quiet threshold, and prompt pattern matching. Emits normalized events to daemon's `/event/normalized` endpoint. Low false positive rate (prompt patterns + timeout), minimal performance impact (2s poll interval), harness-agnostic. Full findings in `docs/notes/decisions.md` under "Tmux Detector Viability". For Claude Code, hook-based detection remains primary (full fidelity, zero latency), but the detector enables Trail Boss to work with any future harness lacking hooks.
+1. **Auto-advance residual / auto-jump on resolve** — implemented as an opt-in feature via
+   `TRAILBOSS_AUTO_JUMP=1` environment variable (default off). When enabled, after a dequeue
+   event (`UserPromptSubmit` fires) for the pane the operator's tmux client is currently attached
+   to, if the queue is non-empty, the daemon automatically performs the same `switch-client`/
+   `select-window`/`select-pane` sequence used by `trailboss jump-next`. The no-forced-focus-
+   steal invariant (AS-6) is preserved: auto-jump only triggers for the pane you're currently on,
+   and only when you explicitly opt in. Resolved 2026-08-15.
+
+~~5. **Harness layering / adapter contract** — define the normalized stuck/unstuck event the daemon consumes, so detection stays isolated to a per-harness adapter. Is a purely tmux-level detector (no hooks) viable as a universal fallback for future harnesses?~~ **RESOLVED (2026-07-02):** Yes, a purely tmux-level detector is viable as a universal fallback. Implemented in `daemon/tmux-detector.ts` with opt-in via `@tb-` pane title prefix, 30s quiet threshold, and prompt pattern matching. Emits normalized events to daemon's `/event/normalized` endpoint. Low false positive rate (prompt patterns + timeout), minimal performance impact (2s poll interval), harness-agnostic. Full findings in `docs/notes/decisions.md` under "Tmux Detector Viability". For Claude Code, hook-based detection remains primary (full fidelity, zero latency), but the detector enables Trail Boss to work with any future harness lacking hooks.
 
 2. ~~**`PermissionRequest` specifics** — confirm it fires for the gate types you hit and what its
    payload carries (the proposed command, for display). Detection coverage depends on it; phase 1.~~ **Resolved (probe 2026-05-25):** confirmed firing with `tool_name` + `tool_input` payload; permission block emits `PermissionRequest` and **no** `Stop`.
