@@ -34,13 +34,13 @@ async function sendTelegramNotification(message: string): Promise<boolean> {
 
   try {
     const requestBody: Record<string, unknown> = {
-      chat_id: parseInt(TELEGRAM_CHAT_ID, 10),
+      chat_id: TELEGRAM_CHAT_ID,
       text: message,
       parse_mode: "Markdown",
     };
 
     if (TELEGRAM_THREAD_ID) {
-      requestBody.thread_id = parseInt(TELEGRAM_THREAD_ID, 10);
+      requestBody.thread_id = TELEGRAM_THREAD_ID;
     }
 
     const response = await fetch(`${PROXY_URL}/send`, {
