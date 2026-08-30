@@ -263,7 +263,8 @@ export function getStarvationDiagnostic(): StarvationDiagnostic {
 
   try {
     // Query all beads using the bead CLI
-    const beadJson = execSync("bead list --json", { encoding: "utf-8" });
+    // Use full path because systemd service doesn't have ~/.local/bin in PATH
+    const beadJson = execSync("/home/coding/.local/bin/bead list --json", { encoding: "utf-8" });
 
     // Parse JSON lines (bead list --json outputs one JSON object per line)
     const lines = beadJson.trim().split("\n").filter(line => line.length > 0);

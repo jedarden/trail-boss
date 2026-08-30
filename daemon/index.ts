@@ -5,7 +5,7 @@ import * as path from "path";
 import { fileURLToPath } from "url";
 import type { HookEvent, NormalizedEvent } from "./types.ts";
 import { adaptHookEvent, isStuckEvent, isUnstuckEvent, isSessionRegistered, isSessionEnded } from "./claude-adapter.ts";
-import { upsertSession, deleteSession, enqueue, dequeue, dequeueByPaneId, skipHead, getHead, getStuckCount, getAllStuck, cleanupQueue, getSession } from "./db.ts";
+import { upsertSession, deleteSession, enqueue, dequeue, dequeueByPaneId, skipHead, getHead, getStuckCount, getAllStuck, cleanupQueue, getSession, getStarvationDiagnostic } from "./db.ts";
 import { startReconcileLoop, reconcileStuckDirection, startStarvationDetection } from "./reconcile.ts";
 import { startNotificationChecker } from "./notify.ts";
 import { execSync } from "child_process";
@@ -384,6 +384,22 @@ const server = http.createServer(async (req, res) => {
       const stuckCount = getStuckCount();
       res.writeHead(200, { "Content-Type": "application/json" });
       res.end(JSON.stringify({ status: "ok", stuckCount }));
+      return;
+    }
+
+    // GET /diagnostic/starvation - bead starvation diagnostic endpoint
+    // Returns: total open beads, visible beads (after Pluck filtering), and exclusion reasons
+    if (req.method === "GET" && url.pathname === "/diagnostic/starvation") {
+      try {
+        const diagnostic = getStarvationDiagnostic();
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify(diagnostic));
+      } catch (err) {
+        const error = err instanceof Error ? err.message : String(err);
+        console.error("[diagnostic/starvation] error:", err);
+        res.writeHead(500, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: "Failed to query bead database", details: error }));
+      }
       return;
     }
 
