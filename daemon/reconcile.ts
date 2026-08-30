@@ -110,18 +110,20 @@ interface StarvationDiagnostic {
 // Detect bead starvation: open beads that aren't visible to pluck (ready frontier)
 export async function detectBeadStarvation(): Promise<StarvationDiagnostic | null> {
   try {
-    const workspace = process.cwd();
+    // Bead store is in workspace root, not daemon directory
+    const workspace = process.env.PWD || process.cwd();
+    const workspaceRoot = workspace.endsWith("/daemon") ? workspace.slice(0, -7) : workspace;
     const timestamp = new Date().toISOString();
 
     // Get open bead count (parse JSON array, not line-count)
-    const openResult = execSync("/home/coding/.local/bin/bead list --status open --json", {
+    const openResult = execSync(`cd "${workspaceRoot}" && /home/coding/.local/bin/bead list --status open --json`, {
       encoding: "utf-8",
       timeout: 10000,
     });
     const openBeads = JSON.parse(openResult.trim());
 
     // Get ready (pluck-visible) bead count (parse JSON array, not line-count)
-    const readyResult = execSync("/home/coding/.local/bin/bead list --ready --json", {
+    const readyResult = execSync(`cd "${workspaceRoot}" && /home/coding/.local/bin/bead list --ready --json`, {
       encoding: "utf-8",
       timeout: 10000,
     });
@@ -154,7 +156,7 @@ export async function detectBeadStarvation(): Promise<StarvationDiagnostic | nul
 
     const diagnostic: StarvationDiagnostic = {
       timestamp,
-      workspace,
+      workspace: workspaceRoot,
       open_beads: openCount,
       ready_beads: readyCount,
       excluded_beads: excludedCount,
@@ -166,11 +168,14 @@ export async function detectBeadStarvation(): Promise<StarvationDiagnostic | nul
     // Attempt recovery
     diagnostic.recovery_attempts.push("attempting bead sync flush");
     try {
-      execSync("/home/coding/.local/bin/bead sync flush-only", { encoding: "utf-8", timeout: 30000 });
+      execSync(`cd "${workspaceRoot}" && /home/coding/.local/bin/bead sync flush-only`, {
+        encoding: "utf-8",
+        timeout: 30000,
+      });
       diagnostic.recovery_attempts.push("bead sync flush completed");
 
       // Re-check after recovery
-      const readyAfterResult = execSync("/home/coding/.local/bin/bead list --ready --json", {
+      const readyAfterResult = execSync(`cd "${workspaceRoot}" && /home/coding/.local/bin/bead list --ready --json`, {
         encoding: "utf-8",
         timeout: 10000,
       });
