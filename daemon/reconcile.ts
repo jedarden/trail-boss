@@ -138,17 +138,9 @@ export async function detectBeadStarvation(): Promise<StarvationDiagnostic | nul
 
     console.log(`[starvation] detected: ${openCount} open beads, ${readyCount} ready beads, ${excludedCount} excluded`);
 
-    // Analyze exclusion reasons
+    // Analyze exclusion reasons (bead list --json returns already-parsed objects)
     const exclusionReasons: string[] = [];
-    const openBeadsData = openBeads.map(line => {
-      try {
-        return JSON.parse(line);
-      } catch {
-        return null;
-      }
-    }).filter(Boolean);
-
-    for (const bead of openBeadsData) {
+    for (const bead of openBeads) {
       if (bead.assignee && bead.assignee !== "null") {
         exclusionReasons.push(`bead ${bead.id} assigned to ${bead.assignee}`);
       }
