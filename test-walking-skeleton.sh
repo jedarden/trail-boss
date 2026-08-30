@@ -510,6 +510,26 @@ fi
 echo "[pass] AS-8 complete"
 
 # ========================================================================
+# Invariant Checks (per plan Testing & validation section)
+# ========================================================================
+echo ""
+echo "=== Running Invariant Checks ==="
+echo "Testing trust boundary and input guarantees (per plan.md)"
+echo ""
+
+# Kill daemon before running invariant tests (they start their own)
+kill $DAEMON_PID 2>/dev/null || true
+sleep 1
+
+# Run invariant tests
+if bash "$TB_DIR/test-invariants.sh"; then
+  echo "[ok] Invariant tests passed"
+else
+  echo "[fail] Invariant tests failed"
+  exit 1
+fi
+
+# ========================================================================
 # Summary
 # ========================================================================
 echo ""
@@ -522,5 +542,8 @@ echo "✓ AS-4: Dropped-event recovery"
 echo "✓ AS-5: Skip + cooldown"
 echo "✓ AS-6: No forced focus-steal"
 echo "✓ AS-7: Pane reuse regression"
+echo "✓ Invariant 1: Loopback-only binding"
+echo "✓ Invariant 2: No synthesized input (no send-keys in daemon)"
+echo "✓ Invariant 3: OPTIONS preflight rejected (CORS disabled)"
 echo ""
 echo "[ok] Phase 6 Walking Skeleton complete"
