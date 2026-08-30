@@ -131,8 +131,8 @@ export async function detectBeadStarvation(): Promise<StarvationDiagnostic | nul
     const readyCount = readyBeads.length;
     const excludedCount = openCount - readyCount;
 
-    // No starvation if counts match
-    if (excludedCount === 0) {
+    // No starvation if there are no open beads, or if all open beads are ready
+    if (openCount === 0 || excludedCount === 0) {
       return null;
     }
 
