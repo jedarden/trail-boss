@@ -15,6 +15,11 @@ const HOST = "127.0.0.1"; // Loopback only
 const SKIP_COOLDOWN_MS = 30_000; // 30 seconds
 const AUTO_JUMP_ENABLED = process.env.TRAILBOSS_AUTO_JUMP === "1";
 const SPOOL_FILE = path.join(path.dirname(fileURLToPath(import.meta.url)), "../../.trailboss-spool.jsonl");
+const DATA_DIR = process.env.TRAILBOSS_DATA_DIR ?? path.join(process.env.HOME ?? "", ".local/share/trailboss");
+const FAILED_EVENTS_FILE = path.join(DATA_DIR, "failed-events.jsonl");
+
+// Ensure data directory exists
+fs.mkdirSync(DATA_DIR, { recursive: true });
 
 // Replay spooled events from client-side failures during daemon restart
 function replaySpool(): { replayed: number; failed: number } {
@@ -32,6 +37,7 @@ function replaySpool(): { replayed: number; failed: number } {
 
   let replayed = 0;
   let failed = 0;
+  const failedEntries: Array<{ timestamp: string; paneId: string; payload: string; error: string }> = [];
 
   for (const line of lines) {
     // Spool format: "TIMESTAMP PANE_ID JSON_PAYLOAD"
@@ -40,7 +46,9 @@ function replaySpool(): { replayed: number; failed: number } {
     const spaceIndex2 = line.indexOf(" ", spaceIndex1 + 1);
 
     if (spaceIndex1 === -1 || spaceIndex2 === -1) {
-      console.error(`[spool] malformed line, skipping: ${line.slice(0, 50)}...`);
+      const error = `malformed line (missing timestamp/pane_id delimiter)`;
+      console.error(`[spool] ${error}, skipping: ${line.slice(0, 50)}...`);
+      failedEntries.push({ timestamp: new Date().toISOString(), paneId: "unknown", payload: line, error });
       failed++;
       continue;
     }
@@ -91,8 +99,23 @@ function replaySpool(): { replayed: number; failed: number } {
 
       replayed++;
     } catch (err) {
-      console.error(`[spool] failed to replay event: ${err}`);
+      const error = err instanceof Error ? err.message : String(err);
+      console.error(`[spool] failed to replay event: ${error}`);
+      failedEntries.push({ timestamp, paneId, payload, error });
       failed++;
+    }
+  }
+
+  // Log failed events to persistent file for forensics
+  if (failedEntries.length > 0) {
+    try {
+      const failedLog = failedEntries.map(entry =>
+        JSON.stringify({ timestamp: entry.timestamp, pane_id: entry.paneId, error: entry.error, payload: entry.payload })
+      ).join("\n") + "\n";
+      fs.appendFileSync(FAILED_EVENTS_FILE, failedLog);
+      console.log(`[spool] logged ${failedEntries.length} failed events to ${FAILED_EVENTS_FILE}`);
+    } catch (err) {
+      console.error(`[spool] failed to write to ${FAILED_EVENTS_FILE}: ${err}`);
     }
   }
 
