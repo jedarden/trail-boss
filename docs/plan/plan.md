@@ -439,6 +439,14 @@ exercises behavior without burning model quota.
 - **AS-7 — pane reuse (regression):** a session ends and its pane is reused by a new session;
   the new session's first event re-asserts `session_id → pane`, and navigation targets the
   current pane, never the retired one.
+- **AS-8 — real transcript format:** sessions enqueue/dequeue correctly with ISO 8601
+  timestamps and nested `message.role` fields (matching the actual Claude Code transcript
+  format). The reconcile loop correctly parses this format and dequeues when a new user
+  entry appears.
+- **AS-9 — auto-jump on resolve (opt-in):** when `TRAILBOSS_AUTO_JUMP=1` is set, resolving
+  a session (via `UserPromptSubmit`) automatically jumps the operator's tmux client to the next
+  stuck session if the queue is non-empty. The default behavior (no env var) preserves the
+  no-forced-focus-steal invariant (AS-6); auto-jump requires explicit opt-in.
 
 ### Test harness & approach
 

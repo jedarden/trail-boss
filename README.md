@@ -156,6 +156,44 @@ For Claude Code sessions, hook-based detection is primary (full fidelity, zero l
 
 ---
 
+## Configuration
+
+### Environment variables
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `TRAILBOSS_AUTO_JUMP` | `0` (off) | When set to `1`, automatically jump to the next stuck session after resolving the current one (opt-in convenience feature) |
+| `TRAILBOSS_DATA_DIR` | `~/.local/share/trailboss` | Directory for daemon state and failed event logs |
+
+### Auto-jump behavior (opt-in)
+
+By default, Trail Boss preserves the **no forced focus-steal** invariant: resolving a session (via `UserPromptSubmit`) does not auto-switch your tmux client to another pane. You must explicitly press `prefix+Tab` to advance.
+
+If you prefer automatic advancement, set `TRAILBOSS_AUTO_JUMP=1`:
+
+```bash
+# Enable auto-jump for this session
+export TRAILBOSS_AUTO_JUMP=1
+systemctl --user restart trailboss-daemon
+
+# Or enable persistently via systemd drop-in
+mkdir -p ~/.config/systemd/user/trailboss-daemon.service.d
+cat > ~/.config/systemd/user/trailboss-daemon.service.d/override.conf <<EOF
+[Service]
+Environment=TRAILBOSS_AUTO_JUMP=1
+EOF
+systemctl --user daemon-reload
+systemctl --user restart trailboss-daemon
+```
+
+**How it works:** When auto-jump is enabled, after you submit input in the currently-attached pane (dequeuing it), the daemon checks if the queue still has items. If so, it automatically switches your tmux client to the next session's pane using the same `switch-client`/`select-window`/`select-pane` sequence as `prefix+Tab`.
+
+**Why opt-in:** Auto-jump is convenient for rapid queue depletion but can be disorienting — the moment you hit Enter, you're teleported to another session. The default forces you to affirm each advance, keeping you in control of your attention flow.
+
+---
+
+---
+
 ## Setup
 
 ### 1. Install daemon dependencies

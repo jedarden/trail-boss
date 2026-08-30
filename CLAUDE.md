@@ -56,6 +56,33 @@ For testing/debugging, you can also run the daemon directly:
 cd daemon && bun index.ts
 ```
 
+### Auto-jump on resolve (opt-in)
+
+**Important:** By default, Trail Boss does NOT auto-advance when you resolve a session. This preserves the "no forced focus-steal" invariant (AS-6). You must explicitly press `prefix+Tab` to jump to the next stuck session.
+
+If you prefer automatic advancement, you can opt-in via `TRAILBOSS_AUTO_JUMP=1`:
+
+```bash
+# Enable auto-jump (daemon restart required)
+export TRAILBOSS_AUTO_JUMP=1
+systemctl --user restart trailboss-daemon
+
+# Or enable persistently via systemd drop-in
+mkdir -p ~/.config/systemd/user/trailboss-daemon.service.d
+cat > ~/.config/systemd/user/trailboss-daemon.service.d/override.conf <<EOF
+[Service]
+Environment=TRAILBOSS_AUTO_JUMP=1
+EOF
+systemctl --user daemon-reload
+systemctl --user restart trailboss-daemon
+```
+
+**How it works:** When enabled, the daemon detects when you submit input in a stuck pane (via `UserPromptSubmit` hook). If that pane is currently attached to your tmux client and the queue still has items, the daemon automatically jumps you to the next session using the same navigation sequence as `prefix+Tab`.
+
+**Why opt-in:** Auto-jump trades control for convenience. The moment you hit Enter in a resolved session, you're teleported to the next one. The default forces you to affirm each advance, keeping you in control of your attention flow.
+
+**Testing:** Auto-jump behavior is covered by acceptance test AS-9 in `test-walking-skeleton.sh`.
+
 ## Key Files
 
 - `daemon/index.ts` — HTTP server (ingest, queue, skip, next, status endpoints)

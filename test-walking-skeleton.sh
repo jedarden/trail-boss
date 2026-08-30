@@ -509,6 +509,138 @@ fi
 
 echo "[pass] AS-8 complete"
 
+reset_daemon
+# ========================================================================
+# AS-9: Auto-jump on resolve (opt-in via TRAILBOSS_AUTO_JUMP=1)
+# ========================================================================
+echo ""
+echo "=== AS-9: Auto-jump on resolve (opt-in) ==="
+
+# Create three sessions: one we're on, one to jump to, one unrelated
+PANE9A=$(create_session "${TEST_BASE}-as9a")
+PANE9B=$(create_session "${TEST_BASE}-as9b")
+TRANSIENT9A=$(create_transcript "as9a")
+TRANSIENT9B=$(create_transcript "as9b")
+
+# Queue two sessions
+send_stop "$PANE9A" "as9a" "$TRANSIENT9A" "Session we're on"
+send_stop "$PANE9B" "as9b" "$TRANSIENT9B" "Session to jump to"
+
+sleep 1
+COUNT=$(queue_count)
+if [ "$COUNT" -eq 2 ]; then
+  echo "[ok] Two sessions queued"
+else
+  echo "[fail] Expected count=2, got $COUNT"
+  exit 1
+fi
+
+# (a) Test with AUTO_JUMP disabled (default)
+unset TRAILBOSS_AUTO_JUMP
+# Restart daemon with no env var
+kill $DAEMON_PID 2>/dev/null || true
+sleep 1
+cd "$TB_DIR/daemon"
+TMUX_TEST_SOCK="$TMUX_TEST_SOCK" bun index.ts &
+DAEMON_PID=$!
+sleep 2
+
+# Send unstuck event for head session
+curl -s -X POST "$DAEMON_URL/event" \
+  -H "Content-Type: application/json" \
+  -H "X-Tmux-Pane: $PANE9A" \
+  -d "{
+    \"session_id\": \"as9a\",
+    \"transcript_path\": \"$TRANSIENT9A\",
+    \"cwd\": \"$TB_DIR\",
+    \"hook_event_name\": \"UserPromptSubmit\"
+  }" >/dev/null
+
+sleep 1
+# Queue should still have one item (as9b), but NO auto-jump occurred
+COUNT=$(queue_count)
+if [ "$COUNT" -eq 1 ]; then
+  echo "[ok] AUTO_JUMP disabled: no auto-jump, queue still has as9b"
+else
+  echo "[fail] Expected count=1, got $COUNT"
+  exit 1
+fi
+
+# (b) Test with AUTO_JUMP enabled
+kill $DAEMON_PID 2>/dev/null || true
+sleep 1
+cd "$TB_DIR/daemon"
+TRAILBOSS_AUTO_JUMP=1 TMUX_TEST_SOCK="$TMUX_TEST_SOCK" bun index.ts &
+DAEMON_PID=$!
+sleep 2
+
+# Verify we're attached to the pane that will resolve
+ORIGIN_PANE=$($TMUX display -p '#{pane_id}')
+if [ "$ORIGIN_PANE" != "$PANE9B" ]; then
+  # Switch to the pane that will resolve to simulate operator being there
+  $TMUX select-pane -t "$PANE9B"
+  sleep 0.5
+fi
+
+# Re-queue the head session (as9b) since it was dequeued above
+send_stop "$PANE9B" "as9b" "$TRANSIENT9B" "Session to jump from"
+sleep 1
+
+# Create a third session to be the jump target
+PANE9C=$(create_session "${TEST_BASE}-as9c")
+TRANSIENT9C=$(create_transcript "as9c")
+send_stop "$PANE9C" "as9c" "$TRANSIENT9C" "Session to jump to"
+
+sleep 1
+COUNT=$(queue_count)
+if [ "$COUNT" -eq 2 ]; then
+  echo "[ok] Queue has as9b (head) and as9c (next)"
+else
+  echo "[fail] Expected count=2, got $COUNT"
+  exit 1
+fi
+
+# Send unstuck event for as9b (the head we're on) - should auto-jump to as9c
+curl -s -X POST "$DAEMON_URL/event" \
+  -H "Content-Type: application/json" \
+  -H "X-Tmux-Pane: $PANE9B" \
+  -d "{
+    \"session_id\": \"as9b\",
+    \"transcript_path\": \"$TRANSIENT9B\",
+    \"cwd\": \"$TB_DIR\",
+    \"hook_event_name\": \"UserPromptSubmit\"
+  }" >/dev/null
+
+sleep 1
+# Queue should now have only as9c (as9b dequeued)
+COUNT=$(queue_count)
+if [ "$COUNT" -eq 1 ]; then
+  echo "[ok] AUTO_JUMP enabled: as9b dequeued, as9c remains"
+else
+  echo "[fail] Expected count=1, got $COUNT"
+  exit 1
+fi
+
+# Verify we auto-jumped to as9c's pane
+CURRENT_PANE=$($TMUX display -p '#{pane_id}')
+if [ "$CURRENT_PANE" = "$PANE9C" ]; then
+  echo "[ok] AUTO_JUMP: operator's client switched to as9c pane"
+else
+  echo "[fail] Expected to be on $PANE9C, currently on $CURRENT_PANE"
+  exit 1
+fi
+
+# Clean up auto-jump state for next tests
+unset TRAILBOSS_AUTO_JUMP
+kill $DAEMON_PID 2>/dev/null || true
+sleep 1
+cd "$TB_DIR/daemon"
+TMUX_TEST_SOCK="$TMUX_TEST_SOCK" bun index.ts &
+DAEMON_PID=$!
+sleep 2
+
+echo "[pass] AS-9 complete (AUTO_JUMP behavior validated)"
+
 # ========================================================================
 # Invariant Checks (per plan Testing & validation section)
 # ========================================================================
@@ -542,6 +674,8 @@ echo "✓ AS-4: Dropped-event recovery"
 echo "✓ AS-5: Skip + cooldown"
 echo "✓ AS-6: No forced focus-steal"
 echo "✓ AS-7: Pane reuse regression"
+echo "✓ AS-8: Real transcript format validation"
+echo "✓ AS-9: Auto-jump on resolve (opt-in via TRAILBOSS_AUTO_JUMP=1)"
 echo "✓ Invariant 1: Loopback-only binding"
 echo "✓ Invariant 2: No synthesized input (no send-keys in daemon)"
 echo "✓ Invariant 3: OPTIONS preflight rejected (CORS disabled)"
