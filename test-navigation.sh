@@ -13,6 +13,9 @@ cleanup() {
 }
 trap cleanup EXIT
 
+# Add bun to PATH
+export PATH="$HOME/.bun/bin:$PATH"
+
 echo "[test] Phase 4: Navigation exit criterion"
 echo "[test] criterion: jump-next lands operator on pane returned by /next"
 

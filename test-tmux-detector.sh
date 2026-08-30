@@ -18,6 +18,9 @@ set -e
 
 TB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 DAEMON_URL="http://127.0.0.1:4000"
+
+# Add bun to PATH
+export PATH="$HOME/.bun/bin:$PATH"
 DATA_DIR="$HOME/.local/share/trailboss"
 
 # Isolated tmux socket — never touches the user's main server
@@ -128,6 +131,7 @@ TRAILBOSS_POLL_INTERVAL_MS=500 \
 TRAILBOSS_QUIET_THRESHOLD_MS=3000 \
 TRAILBOSS_DAEMON_URL="$DAEMON_URL/event/normalized" \
 TRAILBOSS_OPT_IN_PREFIX="@tb-test-" \
+TMUX="$TMUX" \
 bun tmux-detector.ts > /tmp/tb-detector-log-$$ 2>&1 &
 DETECTOR_PID=$!
 echo "[step 2] detector running (PID $DETECTOR_PID)"

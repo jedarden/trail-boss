@@ -15,6 +15,9 @@ cleanup() {
 }
 trap cleanup EXIT
 
+# Add bun to PATH
+export PATH="$HOME/.bun/bin:$PATH"
+
 echo "[test] Phase 5: Presentation exit criterion"
 echo "[test] criterion: Next/Skip keybindings and popup work; status shows count"
 

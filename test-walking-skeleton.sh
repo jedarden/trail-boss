@@ -22,6 +22,9 @@ cleanup() {
 }
 trap cleanup EXIT
 
+# Add bun to PATH
+export PATH="$HOME/.bun/bin:$PATH"
+
 echo "=== Phase 6 Walking Skeleton Test ==="
 echo "Acceptance Scenarios AS-1 through AS-7"
 echo ""

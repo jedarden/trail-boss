@@ -15,6 +15,9 @@ cleanup() {
 
 trap cleanup EXIT
 
+# Add bun to PATH
+export PATH="$HOME/.bun/bin:$PATH"
+
 echo "[test] creating test transcripts..."
 mkdir -p "$TRANSCRIPT_TEST_DIR"
 

@@ -17,6 +17,9 @@ cleanup() {
 
 trap cleanup EXIT
 
+# Add bun to PATH
+export PATH="$HOME/.bun/bin:$PATH"
+
 echo "[test] creating test environment..."
 mkdir -p "$NOTIFY_TEST_DIR"
 

@@ -17,6 +17,9 @@ cleanup() {
 }
 trap cleanup EXIT
 
+# Add bun to PATH
+export PATH="$HOME/.bun/bin:$PATH"
+
 echo "=== Invariant Tests ==="
 echo "Testing trust boundary and input guarantees"
 echo ""
