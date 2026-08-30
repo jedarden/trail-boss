@@ -113,19 +113,19 @@ export async function detectBeadStarvation(): Promise<StarvationDiagnostic | nul
     const workspace = process.cwd();
     const timestamp = new Date().toISOString();
 
-    // Get open bead count
+    // Get open bead count (parse JSON array, not line-count)
     const openResult = execSync("/home/coding/.local/bin/bead list --status open --json", {
       encoding: "utf-8",
       timeout: 10000,
     });
-    const openBeads = openResult.trim().split("\n").filter(line => line.length > 0);
+    const openBeads = JSON.parse(openResult.trim());
 
-    // Get ready (pluck-visible) bead count
+    // Get ready (pluck-visible) bead count (parse JSON array, not line-count)
     const readyResult = execSync("/home/coding/.local/bin/bead list --ready --json", {
       encoding: "utf-8",
       timeout: 10000,
     });
-    const readyBeads = readyResult.trim().split("\n").filter(line => line.length > 0);
+    const readyBeads = JSON.parse(readyResult.trim());
 
     const openCount = openBeads.length;
     const readyCount = readyBeads.length;
@@ -182,7 +182,7 @@ export async function detectBeadStarvation(): Promise<StarvationDiagnostic | nul
         encoding: "utf-8",
         timeout: 10000,
       });
-      const readyAfterCount = readyAfterResult.trim().split("\n").filter(line => line.length > 0).length;
+      const readyAfterCount = JSON.parse(readyAfterResult.trim()).length;
 
       if (readyAfterCount === openCount) {
         diagnostic.recovered = true;
