@@ -2,6 +2,7 @@
 import { Database } from "bun:sqlite";
 import * as fs from "fs";
 import * as path from "path";
+import { execSync } from "child_process";
 
 const DATA_DIR = process.env.TRAILBOSS_DATA_DIR ?? path.join(process.env.HOME ?? "", ".local/share/trailboss");
 const DB_PATH = path.join(DATA_DIR, "trailboss.db");
@@ -209,4 +210,167 @@ export function cleanupQueue(olderThanMs: number = 24 * 60 * 60 * 1000): void {
   const cutoff = Date.now() - olderThanMs;
   const stmt = db.prepare("DELETE FROM queue WHERE dequeued_at < ?");
   stmt.run(cutoff);
+}
+
+// Bead database access for starvation diagnostics
+// We use the bead CLI to query instead of opening SQLite directly
+// because the bead-rs database may have locking/compatibility issues
+
+interface Bead {
+  id: string;
+  title: string;
+  status: string;
+  effective_status: string;
+  labels: string[];
+  assignee: string | null;
+  dependencies: Array<{ blocker: string; kind: string }>;
+  manual_blocked: boolean;
+  priority: number;
+  created_at: string;
+  updated_at: string;
+}
+
+interface ExclusionReason {
+  bead_id: string;
+  title: string;
+  reasons: string[];
+}
+
+interface StarvationDiagnostic {
+  total_open_beads: number;
+  pluck_visible_beads: number;
+  invisible_beads: ExclusionReason[];
+  exclusion_summary: {
+    blocked: number;
+    manual_blocked: number;
+    human: number;
+    deferred_assignee: number;
+    dependency: number;
+  };
+  timestamp: string;
+}
+
+/**
+ * Query the bead database via bead CLI and compute starvation diagnostics.
+ *
+ * This function:
+ * 1. Queries all beads using the bead CLI
+ * 2. Applies Pluck's filtering logic (labels, status, assignee, dependencies)
+ * 3. Returns counts and detailed exclusion reasons for invisible beads
+ */
+export function getStarvationDiagnostic(): StarvationDiagnostic {
+  const now = new Date().toISOString();
+
+  try {
+    // Query all beads using the bead CLI
+    const beadJson = execSync("bead list --json", { encoding: "utf-8" });
+
+    // Parse JSON lines (bead list --json outputs one JSON object per line)
+    const lines = beadJson.trim().split("\n").filter(line => line.length > 0);
+    const allBeads: Bead[] = lines.map(line => JSON.parse(line));
+
+    return computeDiagnostics(allBeads, now);
+  } catch (err) {
+    throw new Error(`Failed to query beads: ${err instanceof Error ? err.message : String(err)}`);
+  }
+}
+
+/**
+ * Compute starvation diagnostics from a list of beads.
+ */
+function computeDiagnostics(beads: Bead[], now: string): StarvationDiagnostic {
+  // Count open beads (not done/closed and not in_progress)
+  const openBeads = beads.filter(function(bead) {
+    const status = bead.status.toLowerCase();
+    return !["closed", "done"].includes(status) && status !== "in_progress";
+  });
+
+  const totalOpen = openBeads.length;
+
+  // Default exclusion labels from Pluck
+  const defaultExcludeLabels = ["deferred", "human", "blocked"];
+  const excludeLabelSet = new Set(defaultExcludeLabels.map(l => l.toLowerCase()));
+
+  // Build map of finished beads for dependency checking
+  const finishedById = new Map<string, boolean>();
+  for (const bead of beads) {
+    finishedById.set(bead.id, ["closed", "done"].includes(bead.status.toLowerCase()));
+  }
+
+  // Analyze each open bead for exclusion reasons
+  const invisibleBeads: ExclusionReason[] = [];
+  const exclusionSummary = {
+    blocked: 0,
+    manual_blocked: 0,
+    human: 0,
+    deferred_assignee: 0,
+    dependency: 0,
+  };
+
+  let visibleCount = 0;
+
+  for (const bead of openBeads) {
+    const reasons: string[] = [];
+
+    // Check for blocking dependencies
+    for (const dep of bead.dependencies) {
+      const isBlocking = !dep.kind || dep.kind.toLowerCase() === "blocks";
+      if (isBlocking) {
+        const blockerFinished = finishedById.get(dep.blocker) ?? false;
+        if (!blockerFinished) {
+          reasons.push(`dependency:${dep.blocker}`);
+          exclusionSummary.dependency++;
+        }
+      }
+    }
+
+    // Check manual_blocked status
+    if (bead.manual_blocked) {
+      reasons.push("manual_blocked:true");
+      exclusionSummary.manual_blocked++;
+    }
+
+    // Check for exclusion labels
+    for (const label of bead.labels) {
+      if (excludeLabelSet.has(label.toLowerCase())) {
+        reasons.push(`label:${label}`);
+        if (label.toLowerCase() === "blocked") {
+          exclusionSummary.blocked++;
+        } else if (label.toLowerCase() === "human") {
+          exclusionSummary.human++;
+        }
+      }
+    }
+
+    // Check deferred status or label
+    if (bead.status.toLowerCase() === "deferred" || bead.labels.map(l => l.toLowerCase()).includes("deferred")) {
+      reasons.push("status:deferred");
+      exclusionSummary.deferred_assignee++;
+    }
+
+    // Check assignee
+    if (bead.assignee) {
+      reasons.push(`assignee:${bead.assignee}`);
+      exclusionSummary.deferred_assignee++;
+    }
+
+    // If no exclusion reasons, the bead is visible to Pluck
+    if (reasons.length === 0) {
+      visibleCount++;
+    } else {
+      invisibleBeads.push({
+        bead_id: bead.id,
+        title: bead.title,
+        reasons,
+      });
+    }
+  }
+
+  return {
+    total_open_beads: totalOpen,
+    pluck_visible_beads: visibleCount,
+    invisible_beads: invisibleBeads,
+    exclusion_summary: exclusionSummary,
+    timestamp: now,
+  };
 }
