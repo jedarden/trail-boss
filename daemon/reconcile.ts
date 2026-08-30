@@ -94,6 +94,181 @@ export function startReconcileLoop(intervalMs: number = 5000): void {
   }, intervalMs);
 }
 
+// Bead starvation detection and recovery
+interface StarvationDiagnostic {
+  timestamp: string;
+  workspace: string;
+  open_beads: number;
+  ready_beads: number;
+  excluded_beads: number;
+  exclusion_reasons: string[];
+  recovered: boolean;
+  recovery_attempts: string[];
+  error?: string;
+}
+
+// Detect bead starvation: open beads that aren't visible to pluck (ready frontier)
+export async function detectBeadStarvation(): Promise<StarvationDiagnostic | null> {
+  try {
+    const workspace = process.cwd();
+    const timestamp = new Date().toISOString();
+
+    // Get open bead count
+    const openResult = execSync("bead list --status open --json", {
+      encoding: "utf-8",
+      timeout: 10000,
+    });
+    const openBeads = openResult.trim().split("\n").filter(line => line.length > 0);
+
+    // Get ready (pluck-visible) bead count
+    const readyResult = execSync("bead list --ready --json", {
+      encoding: "utf-8",
+      timeout: 10000,
+    });
+    const readyBeads = readyResult.trim().split("\n").filter(line => line.length > 0);
+
+    const openCount = openBeads.length;
+    const readyCount = readyBeads.length;
+    const excludedCount = openCount - readyCount;
+
+    // No starvation if counts match
+    if (excludedCount === 0) {
+      return null;
+    }
+
+    console.log(`[starvation] detected: ${openCount} open beads, ${readyCount} ready beads, ${excludedCount} excluded`);
+
+    // Analyze exclusion reasons
+    const exclusionReasons: string[] = [];
+    const openBeadsData = openBeads.map(line => {
+      try {
+        return JSON.parse(line);
+      } catch {
+        return null;
+      }
+    }).filter(Boolean);
+
+    for (const bead of openBeadsData) {
+      if (bead.assignee && bead.assignee !== "null") {
+        exclusionReasons.push(`bead ${bead.id} assigned to ${bead.assignee}`);
+      }
+      if (bead.manual_blocked) {
+        exclusionReasons.push(`bead ${bead.id} manually blocked`);
+      }
+      if (bead.status === "in_progress") {
+        exclusionReasons.push(`bead ${bead.id} in progress`);
+      }
+    }
+
+    const diagnostic: StarvationDiagnostic = {
+      timestamp,
+      workspace,
+      open_beads: openCount,
+      ready_beads: readyCount,
+      excluded_beads: excludedCount,
+      exclusion_reasons: exclusionReasons,
+      recovered: false,
+      recovery_attempts: [],
+    };
+
+    // Attempt recovery
+    diagnostic.recovery_attempts.push("attempting bead sync flush");
+    try {
+      execSync("bead sync flush-only", { encoding: "utf-8", timeout: 30000 });
+      diagnostic.recovery_attempts.push("bead sync flush completed");
+
+      // Re-check after recovery
+      const readyAfterResult = execSync("bead list --ready --json", {
+        encoding: "utf-8",
+        timeout: 10000,
+      });
+      const readyAfterCount = readyAfterResult.trim().split("\n").filter(line => line.length > 0).length;
+
+      if (readyAfterCount === openCount) {
+        diagnostic.recovered = true;
+        diagnostic.recovery_attempts.push("starvation resolved after sync flush");
+      }
+    } catch (err) {
+      const error = err instanceof Error ? err.message : String(err);
+      diagnostic.error = error;
+      diagnostic.recovery_attempts.push(`recovery failed: ${error}`);
+    }
+
+    // Log diagnostic payload
+    logStarvationDiagnostic(diagnostic);
+
+    // Create alert bead if recovery failed
+    if (!diagnostic.recovered) {
+      createStarvationAlertBead(diagnostic);
+    }
+
+    return diagnostic;
+  } catch (err) {
+    console.error("[starvation] detection error:", err);
+    return null;
+  }
+}
+
+// Log starvation diagnostic to .beads/diagnostics/starvation-*.jsonl
+function logStarvationDiagnostic(diagnostic: StarvationDiagnostic): void {
+  try {
+    const diagnosticsDir = ".beads/diagnostics";
+    execSync(`mkdir -p ${diagnosticsDir}`, { stdio: "ignore" });
+
+    const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
+    const logFile = `${diagnosticsDir}/starvation-${timestamp}.jsonl`;
+
+    const logEntry = JSON.stringify(diagnostic) + "\n";
+    execSync(`tee > /dev/null "${logFile}" <<< '${logEntry}'`, { encoding: "utf-8", shell: "/bin/bash" });
+
+    console.log(`[starvation] diagnostic logged to ${logFile}`);
+  } catch (err) {
+    console.error("[starvation] failed to log diagnostic:", err);
+  }
+}
+
+// Create a starvation alert bead
+function createStarvationAlertBead(diagnostic: StarvationDiagnostic): void {
+  try {
+    const description = `Pluck found no candidates but open beads exist.
+
+**Workspace:** ${diagnostic.workspace}
+**Open beads:** ${diagnostic.open_beads}
+**Excluded beads:** ${diagnostic.excluded_beads}
+**Exclusion reasons:** ${diagnostic.exclusion_reasons.join("; ") || "none detected"}
+
+**Timestamp:** ${diagnostic.timestamp}
+
+**Recovery attempts:**
+${diagnostic.recovery_attempts.map(attempt => `- ${attempt}`).join("\n")}
+
+${diagnostic.error ? `**Error:** ${diagnostic.error}` : ""}`;
+
+    const cmd = `bead create --title "Starvation alert: beads invisible in ${diagnostic.workspace}" --priority 2 --issue-type task --label "alert:starvation:unknown" --label "starvation-alert" --notes "${description.replace(/"/g, '\\"')}"`;
+
+    execSync(cmd, { encoding: "utf-8", timeout: 30000 });
+    console.log("[starvation] alert bead created");
+  } catch (err) {
+    console.error("[starvation] failed to create alert bead:", err);
+  }
+}
+
+// Start starvation detection loop (runs every 60 seconds)
+export function startStarvationDetection(intervalMs: number = 60000): void {
+  console.log(`[starvation] started detection loop (interval ${intervalMs}ms)`);
+  setInterval(async () => {
+    const diagnostic = await detectBeadStarvation();
+    if (diagnostic) {
+      console.log(`[starvation] detected ${diagnostic.excluded_beads} excluded beads (open: ${diagnostic.open_beads}, ready: ${diagnostic.ready_beads})`);
+      if (diagnostic.recovered) {
+        console.log(`[starvation] recovery successful`);
+      } else {
+        console.log(`[starvation] recovery failed, alert bead created`);
+      }
+    }
+  }, intervalMs);
+}
+
 // Check if a pane exists in tmux
 function paneExists(paneId: string): boolean {
   try {

@@ -6,7 +6,7 @@ import { fileURLToPath } from "url";
 import type { HookEvent, NormalizedEvent } from "./types.ts";
 import { adaptHookEvent, isStuckEvent, isUnstuckEvent, isSessionRegistered, isSessionEnded } from "./claude-adapter.ts";
 import { upsertSession, deleteSession, enqueue, dequeue, dequeueByPaneId, skipHead, getHead, getStuckCount, getAllStuck, cleanupQueue, getSession } from "./db.ts";
-import { startReconcileLoop, reconcileStuckDirection } from "./reconcile.ts";
+import { startReconcileLoop, reconcileStuckDirection, startStarvationDetection } from "./reconcile.ts";
 import { startNotificationChecker } from "./notify.ts";
 import { execSync } from "child_process";
 
@@ -149,6 +149,9 @@ if (spoolResult.replayed > 0) {
 
 // Start reconcile loop (runs every 5s by default)
 startReconcileLoop(5000);
+
+// Start starvation detection loop (runs every 60s)
+startStarvationDetection(60000);
 
 // Cleanup old queue entries hourly
 setInterval(() => cleanupQueue(), 60 * 60 * 1000);
