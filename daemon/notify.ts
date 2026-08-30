@@ -1,6 +1,6 @@
 // Notification system for Trail Boss
 // Sends alerts when queue depth crosses threshold while operator is away from tmux
-import { getStuckCount, getHead } from "./db.ts";
+import { getStuckCount, getHead, getSession } from "./db.ts";
 
 // Configuration from environment
 const PROXY_URL = process.env.TELEGRAM_PROXY_URL || "http://localhost:8080";

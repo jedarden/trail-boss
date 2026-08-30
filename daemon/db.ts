@@ -112,10 +112,10 @@ export function skipHead(sessionId: string, cooldownMs: number): void {
   stmt.run(now, cooldownUntil, sessionId);
 }
 
-export function getHead(): { id: number; session_id: string; stuck_at: number; skip_cooldown_until: number | null } | null {
+export function getHead(): { id: number; session_id: string; stuck_at: number; skip_cooldown_until: number | null; reason: string } | null {
   const now = Date.now();
   const stmt = db.prepare(`
-    SELECT q.id, q.session_id, q.stuck_at, q.skip_cooldown_until
+    SELECT q.id, q.session_id, q.stuck_at, q.skip_cooldown_until, q.reason
     FROM queue q
     JOIN sessions s ON s.session_id = q.session_id
     WHERE q.dequeued_at IS NULL

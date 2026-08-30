@@ -10,7 +10,7 @@ import { startReconcileLoop, reconcileStuckDirection } from "./reconcile.ts";
 import { startNotificationChecker } from "./notify.ts";
 import { execSync } from "child_process";
 
-const PORT = 4000;
+const PORT = parseInt(process.env.TRAILBOSS_PORT || "4000", 10);
 const HOST = "127.0.0.1"; // Loopback only
 const SKIP_COOLDOWN_MS = 30_000; // 30 seconds
 const AUTO_JUMP_ENABLED = process.env.TRAILBOSS_AUTO_JUMP === "1";
