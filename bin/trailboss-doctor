@@ -1,0 +1,200 @@
+#!/usr/bin/env bash
+# Trail Boss healthcheck — diagnose common issues
+set -e
+
+TB_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)"
+DAEMON_URL="${TRAILBOSS_URL:-http://127.0.0.1:4000}"
+DATA_DIR="${TRAILBOSS_DATA_DIR:-$HOME/.local/share/trailboss}"
+DB_PATH="$DATA_DIR/trailboss.db"
+
+# Color output
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[0;33m'
+BLUE='\033[0;34m'
+NC='\033[0m' # No Color
+
+# Track overall health
+ALL_OK=true
+
+section() {
+  echo -e "\n${BLUE}===> $1${NC}"
+}
+
+ok() {
+  echo -e "${GREEN}✓${NC} $1"
+}
+
+warn() {
+  echo -e "${YELLOW}⚠${NC} $1"
+  ALL_OK=false
+}
+
+fail() {
+  echo -e "${RED}✗${NC} $1"
+  ALL_OK=false
+}
+
+info() {
+  echo "  $1"
+}
+
+# === 1. Daemon Status ===
+section "Daemon Status"
+
+# Check systemd unit
+if systemctl --user is-active --quiet trailboss-daemon 2>/dev/null; then
+  ok "systemd unit 'trailboss-daemon' is active"
+else
+  fail "systemd unit 'trailboss-daemon' is not active"
+  info "Run: systemctl --user start trailboss-daemon"
+fi
+
+# Check if daemon is reachable
+STATUS_RESPONSE=$(curl -s --max-time 1 "$DAEMON_URL/status" 2>/dev/null || echo '{"status":"error"}')
+if echo "$STATUS_RESPONSE" | python3 -c "import json,sys; d=json.load(sys.stdin); exit(0 if d.get('status')=='ok' else 1)" 2>/dev/null; then
+  STUCK_COUNT=$(echo "$STATUS_RESPONSE" | python3 -c "import json,sys; print(json.load(sys.stdin).get('stuckCount', 0))" 2>/dev/null)
+  ok "daemon is reachable at $DAEMON_URL"
+  info "stuckCount: $STUCK_COUNT"
+else
+  fail "daemon is unreachable at $DAEMON_URL"
+  info "Check: journalctl --user -u trailboss-daemon -n 20"
+fi
+
+# === 2. tmux Integration ===
+section "tmux Integration"
+
+if [ -n "$TMUX" ]; then
+  ok "TMUX environment variable is set"
+  PANE_ID="${TMUX_PANE:-unknown}"
+  info "current pane: $PANE_ID"
+
+  # Try to get pane info
+  if tmux display-message -p -t "$PANE_ID" '#{pane_id}' >/dev/null 2>&1; then
+    ok "tmux pane tracking works"
+  else
+    warn "tmux pane lookup failed (may indicate tmux server issue)"
+  fi
+else
+  fail "TMUX environment variable is not set"
+  info "Trail Boss requires running inside tmux"
+  info "Start a tmux session first: tmux new -s trail-boss"
+fi
+
+# === 3. Hook Configuration ===
+section "Hook Configuration"
+
+SETTINGS_FILE="$HOME/.claude/settings.json"
+HOOK_SCRIPT="$TB_DIR/.claude/trailboss-emit.sh"
+
+if [ ! -f "$SETTINGS_FILE" ]; then
+  fail "settings.json not found at $SETTINGS_FILE"
+else
+  ok "settings.json exists at $SETTINGS_FILE"
+fi
+
+if [ ! -f "$HOOK_SCRIPT" ]; then
+  fail "hook script not found at $HOOK_SCRIPT"
+else
+  ok "hook script exists at $HOOK_SCRIPT"
+fi
+
+# Check if Trail Boss hooks are wired
+if [ -f "$SETTINGS_FILE" ]; then
+  HOOKS_OK=true
+
+  # Expected hook types
+  EXPECTED_HOOKS=("Stop" "PermissionRequest" "SessionStart" "SessionEnd")
+
+  for hook_type in "${EXPECTED_HOOKS[@]}"; do
+    if grep -q "\"$hook_type\"" "$SETTINGS_FILE" && \
+       grep -A5 "\"$hook_type\"" "$SETTINGS_FILE" | grep -q "trailboss-emit"; then
+      ok "$hook_type hook → trailboss-emit"
+    else
+      fail "$hook_type hook → NOT configured or missing trailboss-emit"
+      HOOKS_OK=false
+    fi
+  done
+
+  if [ "$HOOKS_OK" = false ]; then
+    info "Add Trail Boss hooks to $SETTINGS_FILE for: ${EXPECTED_HOOKS[*]}"
+    info "Example hook entry:"
+    info '  "Stop": [{ "hooks": [{ "type": "command", "command": "'"$HOOK_SCRIPT"'" }] }]'
+  fi
+fi
+
+# === 4. Database State ===
+section "Database State"
+
+if [ -f "$DB_PATH" ]; then
+  ok "database exists at $DB_PATH"
+
+  # Check database integrity and get stats
+  DB_STATS=$(sqlite3 "$DB_PATH" "
+    SELECT 'sessions:' || COUNT(*) || ', stuck:' ||
+           (SELECT COUNT(*) FROM queue WHERE dequeued_at IS NULL) || ', queued_total:' ||
+           (SELECT COUNT(*) FROM queue)
+    FROM sessions;
+  " 2>/dev/null || echo "error: unreadable")
+
+  if [[ "$DB_STATS" == error:* ]]; then
+    fail "database is unreadable or corrupted"
+    info "Recover by: rm $DB_PATH (daemon will recreate)"
+  else
+    ok "database is readable"
+    info "$DB_STATS"
+
+    # Check for orphaned queue entries
+    ORPHANED=$(sqlite3 "$DB_PATH" "SELECT COUNT(*) FROM queue q WHERE NOT EXISTS (SELECT 1 FROM sessions s WHERE s.session_id = q.session_id)" 2>/dev/null || echo "0")
+    if [ "$ORPHANED" -gt 0 ]; then
+      warn "$ORPHANED orphaned queue entries (sessions deleted but queue not cleaned)"
+    fi
+  fi
+else
+  warn "database not found at $DB_PATH"
+  info "Daemon will create it on first start"
+fi
+
+# Check spool file
+SPOOL_FILE="$HOME/.trailboss-spool.jsonl"
+if [ -f "$SPOOL_FILE" ]; then
+  SPOOL_LINES=$(wc -l < "$SPOOL_FILE")
+  if [ "$SPOOL_LINES" -gt 0 ]; then
+    warn "spool file has $SPOOL_LINES entries (daemon may have missed events)"
+    info "Spool replays on daemon restart; check daemon logs"
+  else
+    ok "spool file exists and is empty"
+  fi
+else
+  ok "no spool file (no missed events during daemon downtime)"
+fi
+
+# === 5. systemd Unit Status ===
+section "systemd Unit"
+
+UNIT_FILE="$HOME/.config/systemd/user/trailboss-daemon.service"
+if [ -f "$UNIT_FILE" ]; then
+  ok "systemd unit file exists at $UNIT_FILE"
+
+  # Check if enabled
+  if systemctl --user is-enabled trailboss-daemon >/dev/null 2>&1; then
+    ok "systemd unit is enabled (will auto-start on login)"
+  else
+    warn "systemd unit is not enabled"
+    info "Run: systemctl --user enable trailboss-daemon"
+  fi
+else
+  fail "systemd unit file not found at $UNIT_FILE"
+  info "Create it to enable auto-start on login"
+fi
+
+# === Summary ===
+section "Summary"
+
+if [ "$ALL_OK" = true ]; then
+  ok "All checks passed — Trail Boss is healthy"
+  exit 0
+else
+  fail "Some checks failed — see output above"
+  exit 1
+fi
