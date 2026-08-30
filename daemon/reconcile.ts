@@ -114,14 +114,14 @@ export async function detectBeadStarvation(): Promise<StarvationDiagnostic | nul
     const timestamp = new Date().toISOString();
 
     // Get open bead count
-    const openResult = execSync("bead list --status open --json", {
+    const openResult = execSync("/home/coding/.local/bin/bead list --status open --json", {
       encoding: "utf-8",
       timeout: 10000,
     });
     const openBeads = openResult.trim().split("\n").filter(line => line.length > 0);
 
     // Get ready (pluck-visible) bead count
-    const readyResult = execSync("bead list --ready --json", {
+    const readyResult = execSync("/home/coding/.local/bin/bead list --ready --json", {
       encoding: "utf-8",
       timeout: 10000,
     });
@@ -174,11 +174,11 @@ export async function detectBeadStarvation(): Promise<StarvationDiagnostic | nul
     // Attempt recovery
     diagnostic.recovery_attempts.push("attempting bead sync flush");
     try {
-      execSync("bead sync flush-only", { encoding: "utf-8", timeout: 30000 });
+      execSync("/home/coding/.local/bin/bead sync flush-only", { encoding: "utf-8", timeout: 30000 });
       diagnostic.recovery_attempts.push("bead sync flush completed");
 
       // Re-check after recovery
-      const readyAfterResult = execSync("bead list --ready --json", {
+      const readyAfterResult = execSync("/home/coding/.local/bin/bead list --ready --json", {
         encoding: "utf-8",
         timeout: 10000,
       });
@@ -244,7 +244,7 @@ ${diagnostic.recovery_attempts.map(attempt => `- ${attempt}`).join("\n")}
 
 ${diagnostic.error ? `**Error:** ${diagnostic.error}` : ""}`;
 
-    const cmd = `bead create --title "Starvation alert: beads invisible in ${diagnostic.workspace}" --priority 2 --issue-type task --label "alert:starvation:unknown" --label "starvation-alert" --notes "${description.replace(/"/g, '\\"')}"`;
+    const cmd = `/home/coding/.local/bin/bead create --title "Starvation alert: beads invisible in ${diagnostic.workspace}" --priority 2 --issue-type task --label "alert:starvation:unknown" --label "starvation-alert" --notes "${description.replace(/"/g, '\\"')}"`;
 
     execSync(cmd, { encoding: "utf-8", timeout: 30000 });
     console.log("[starvation] alert bead created");
