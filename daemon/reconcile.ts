@@ -115,20 +115,22 @@ export async function detectBeadStarvation(): Promise<StarvationDiagnostic | nul
     const workspaceRoot = workspace.endsWith("/daemon") ? workspace.slice(0, -7) : workspace;
     const timestamp = new Date().toISOString();
 
-    // Get open bead count (parse JSON array, not line-count)
+    // Get open bead count (parse JSONL format - newline-delimited JSON objects)
     // Suppress stderr to avoid diagnostic output breaking JSON parsing
     const openResult = execSync(`cd "${workspaceRoot}" && /home/coding/.local/bin/bead list --status open --json 2>/dev/null`, {
       encoding: "utf-8",
       timeout: 10000,
     });
-    const openBeads = JSON.parse(openResult.trim());
+    // Parse JSONL format: split by newlines and parse each line as a JSON object
+    const openBeads = openResult.trim().split('\n').filter(line => line.trim()).map(line => JSON.parse(line));
 
-    // Get ready (pluck-visible) bead count (parse JSON array, not line-count)
+    // Get ready (pluck-visible) bead count (parse JSONL format)
     const readyResult = execSync(`cd "${workspaceRoot}" && /home/coding/.local/bin/bead list --ready --json 2>/dev/null`, {
       encoding: "utf-8",
       timeout: 10000,
     });
-    const readyBeads = JSON.parse(readyResult.trim());
+    // Parse JSONL format: split by newlines and parse each line as a JSON object
+    const readyBeads = readyResult.trim().split('\n').filter(line => line.trim()).map(line => JSON.parse(line));
 
     const openCount = openBeads.length;
     const readyCount = readyBeads.length;
@@ -175,12 +177,13 @@ export async function detectBeadStarvation(): Promise<StarvationDiagnostic | nul
       });
       diagnostic.recovery_attempts.push("bead sync flush completed");
 
-      // Re-check after recovery (suppress stderr to avoid diagnostic output breaking JSON parsing)
+      // Re-check after recovery (parse JSONL format)
       const readyAfterResult = execSync(`cd "${workspaceRoot}" && /home/coding/.local/bin/bead list --ready --json 2>/dev/null`, {
         encoding: "utf-8",
         timeout: 10000,
       });
-      const readyAfterCount = JSON.parse(readyAfterResult.trim()).length;
+      // Parse JSONL format: split by newlines and parse each line as a JSON object
+      const readyAfterCount = readyAfterResult.trim().split('\n').filter(line => line.trim()).map(line => JSON.parse(line)).length;
 
       if (readyAfterCount === openCount) {
         diagnostic.recovered = true;
