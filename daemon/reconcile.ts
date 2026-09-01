@@ -116,14 +116,15 @@ export async function detectBeadStarvation(): Promise<StarvationDiagnostic | nul
     const timestamp = new Date().toISOString();
 
     // Get open bead count (parse JSON array, not line-count)
-    const openResult = execSync(`cd "${workspaceRoot}" && /home/coding/.local/bin/bead list --status open --json`, {
+    // Suppress stderr to avoid diagnostic output breaking JSON parsing
+    const openResult = execSync(`cd "${workspaceRoot}" && /home/coding/.local/bin/bead list --status open --json 2>/dev/null`, {
       encoding: "utf-8",
       timeout: 10000,
     });
     const openBeads = JSON.parse(openResult.trim());
 
     // Get ready (pluck-visible) bead count (parse JSON array, not line-count)
-    const readyResult = execSync(`cd "${workspaceRoot}" && /home/coding/.local/bin/bead list --ready --json`, {
+    const readyResult = execSync(`cd "${workspaceRoot}" && /home/coding/.local/bin/bead list --ready --json 2>/dev/null`, {
       encoding: "utf-8",
       timeout: 10000,
     });
@@ -174,8 +175,8 @@ export async function detectBeadStarvation(): Promise<StarvationDiagnostic | nul
       });
       diagnostic.recovery_attempts.push("bead sync flush completed");
 
-      // Re-check after recovery
-      const readyAfterResult = execSync(`cd "${workspaceRoot}" && /home/coding/.local/bin/bead list --ready --json`, {
+      // Re-check after recovery (suppress stderr to avoid diagnostic output breaking JSON parsing)
+      const readyAfterResult = execSync(`cd "${workspaceRoot}" && /home/coding/.local/bin/bead list --ready --json 2>/dev/null`, {
         encoding: "utf-8",
         timeout: 10000,
       });
