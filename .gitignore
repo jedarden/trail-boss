@@ -12,3 +12,6 @@ bin/trailboss-tui
 
 # Accidentally created tilde directory
 ~
+
+# NEEDLE execution traces are local diagnostics.
+**/.beads/traces/
