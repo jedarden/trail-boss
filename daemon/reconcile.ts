@@ -1,7 +1,11 @@
 // Transcript reconcile loop: the transcript JSONL is ground truth
 import * as fs from "fs";
-import { execSync } from "child_process";
-import { getSession, dequeue, getSessionsForReconcile, upsertSession, enqueue, getSessionsNotInQueue } from "./db.ts";
+import { execFileSync, execSync } from "child_process";
+import { getSession, dequeue, getSessionsForReconcile, upsertSession, enqueue, getSessionsNotInQueue, BEAD_LIST_LIMIT } from "./db.ts";
+
+// Full path because the systemd service has no ~/.local/bin in PATH.
+// Overridable so tests can point this at a stub CLI (TRAILBOSS_BEAD_BIN).
+const BEAD_BIN = process.env.TRAILBOSS_BEAD_BIN || "/home/coding/.local/bin/bead";
 
 // Real Claude Code transcript entry shape
 interface TranscriptEntry {
@@ -117,7 +121,7 @@ export async function detectBeadStarvation(): Promise<StarvationDiagnostic | nul
 
     // Get open bead count (parse JSONL format - newline-delimited JSON objects)
     // Suppress stderr to avoid diagnostic output breaking JSON parsing
-    const openResult = execSync(`cd "${workspaceRoot}" && /home/coding/.local/bin/bead list --status open --json 2>/dev/null`, {
+    const openResult = execSync(`cd "${workspaceRoot}" && ${BEAD_BIN} list --status open --json --limit ${BEAD_LIST_LIMIT} 2>/dev/null`, {
       encoding: "utf-8",
       timeout: 10000,
     });
@@ -125,7 +129,7 @@ export async function detectBeadStarvation(): Promise<StarvationDiagnostic | nul
     const openBeads = openResult.trim().split('\n').filter(line => line.trim()).map(line => JSON.parse(line));
 
     // Get ready (pluck-visible) bead count (parse JSONL format)
-    const readyResult = execSync(`cd "${workspaceRoot}" && /home/coding/.local/bin/bead list --ready --json 2>/dev/null`, {
+    const readyResult = execSync(`cd "${workspaceRoot}" && ${BEAD_BIN} list --ready --json --limit ${BEAD_LIST_LIMIT} 2>/dev/null`, {
       encoding: "utf-8",
       timeout: 10000,
     });
@@ -171,14 +175,14 @@ export async function detectBeadStarvation(): Promise<StarvationDiagnostic | nul
     // Attempt recovery
     diagnostic.recovery_attempts.push("attempting bead sync flush");
     try {
-      execSync(`cd "${workspaceRoot}" && /home/coding/.local/bin/bead sync flush-only`, {
+      execSync(`cd "${workspaceRoot}" && ${BEAD_BIN} sync flush-only`, {
         encoding: "utf-8",
         timeout: 30000,
       });
       diagnostic.recovery_attempts.push("bead sync flush completed");
 
       // Re-check after recovery (parse JSONL format)
-      const readyAfterResult = execSync(`cd "${workspaceRoot}" && /home/coding/.local/bin/bead list --ready --json 2>/dev/null`, {
+      const readyAfterResult = execSync(`cd "${workspaceRoot}" && ${BEAD_BIN} list --ready --json --limit ${BEAD_LIST_LIMIT} 2>/dev/null`, {
         encoding: "utf-8",
         timeout: 10000,
       });
@@ -210,17 +214,18 @@ export async function detectBeadStarvation(): Promise<StarvationDiagnostic | nul
   }
 }
 
-// Log starvation diagnostic to .beads/diagnostics/starvation-*.jsonl
-function logStarvationDiagnostic(diagnostic: StarvationDiagnostic): void {
+// Log starvation diagnostic to .beads/diagnostics/<prefix>-*.jsonl
+function logStarvationDiagnostic(diagnostic: StarvationDiagnostic, prefix: string = "starvation"): void {
   try {
     const diagnosticsDir = ".beads/diagnostics";
     execSync(`mkdir -p ${diagnosticsDir}`, { stdio: "ignore" });
 
     const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
-    const logFile = `${diagnosticsDir}/starvation-${timestamp}.jsonl`;
+    const logFile = `${diagnosticsDir}/${prefix}-${timestamp}.jsonl`;
 
-    const logEntry = JSON.stringify(diagnostic) + "\n";
-    execSync(`tee > /dev/null "${logFile}" <<< '${logEntry}'`, { encoding: "utf-8", shell: "/bin/bash" });
+    // fs, not a `tee` shell-out: this box has no /bin/bash (NixOS), and the
+    // payload would otherwise be reinterpreted by whatever shell did exist.
+    fs.appendFileSync(logFile, JSON.stringify(diagnostic) + "\n");
 
     console.log(`[starvation] diagnostic logged to ${logFile}`);
   } catch (err) {
@@ -228,10 +233,96 @@ function logStarvationDiagnostic(diagnostic: StarvationDiagnostic): void {
   }
 }
 
-// Create a starvation alert bead
-function createStarvationAlertBead(diagnostic: StarvationDiagnostic): void {
+// A diagnostic is only worth an alert if it actually asserts starvation: a
+// known workspace, at least one open bead, and at least one bead excluded from
+// the ready frontier, with counts that add up. The alert beads filed for
+// trailbos-317b7ae2 were self-inconsistent — blank workspace, 0 open, 0
+// excluded — which describes a detector bug, not starvation.
+//
+// Empty exclusion_reasons is deliberately NOT disqualifying: starvation whose
+// cause the detector cannot name is exactly what `alert:starvation:unknown`
+// covers.
+export function validateStarvationAlert(diagnostic: StarvationDiagnostic): { actionable: boolean; reason?: string } {
+  if (!diagnostic.workspace || diagnostic.workspace.trim() === "") {
+    return { actionable: false, reason: "workspace is blank" };
+  }
+  if (!Number.isFinite(diagnostic.open_beads) || diagnostic.open_beads <= 0) {
+    return { actionable: false, reason: `open_beads is ${diagnostic.open_beads}; starvation requires at least 1` };
+  }
+  if (!Number.isFinite(diagnostic.excluded_beads) || diagnostic.excluded_beads <= 0) {
+    return { actionable: false, reason: `excluded_beads is ${diagnostic.excluded_beads}; starvation requires at least 1` };
+  }
+  if (!Number.isFinite(diagnostic.ready_beads) || diagnostic.ready_beads < 0) {
+    return { actionable: false, reason: `ready_beads is ${diagnostic.ready_beads}; expected a non-negative count` };
+  }
+  if (diagnostic.ready_beads + diagnostic.excluded_beads !== diagnostic.open_beads) {
+    return {
+      actionable: false,
+      reason: `counts disagree: ready (${diagnostic.ready_beads}) + excluded (${diagnostic.excluded_beads}) != open (${diagnostic.open_beads})`,
+    };
+  }
+  return { actionable: true };
+}
+
+// One detector-bug bead per process: a broken detector would otherwise file a
+// bug bead every detection interval on top of the diagnostics it logs.
+let detectorBugBeadFiled = false;
+
+// A diagnostic the detector could not act on means the detector emitted
+// nonsense — a bug in the detector, not starvation in the workspace. File one
+// bug bead so the emitter gets fixed, instead of an operator triaging a
+// phantom starvation alert.
+function fileDetectorBugBead(reason: string, diagnostic: StarvationDiagnostic): void {
+  if (detectorBugBeadFiled) {
+    console.log("[starvation] detector-bug bead already filed this process; diagnostic logged only");
+    return;
+  }
+
+  const description = `The starvation detector produced a diagnostic it could not act on.
+
+**Reason:** ${reason}
+
+\`\`\`json
+${JSON.stringify(diagnostic, null, 2)}
+\`\`\`
+
+The diagnostic was written to .beads/diagnostics/starvation-detector-bug-*.jsonl.
+No starvation alert bead was created from it (guard added in trailbos-6d972074,
+cross-linked to trailbos-317b7ae2).`;
+
   try {
-    const description = `Pluck found no candidates but open beads exist.
+    execFileSync(
+      BEAD_BIN,
+      [
+        "create",
+        "--title", "Starvation detector bug: non-actionable diagnostic reached the alert emitter",
+        "--priority", "2",
+        "--issue-type", "bug",
+        "--label", "starvation-detector-bug",
+        "--description", description,
+      ],
+      { encoding: "utf-8", timeout: 30000 }
+    );
+    detectorBugBeadFiled = true;
+    console.log("[starvation] detector-bug bead created");
+  } catch (err) {
+    console.error("[starvation] failed to create detector-bug bead:", err);
+  }
+}
+
+// Create a starvation alert bead. Self-inconsistent diagnostics are never
+// alerted: they are routed to .beads/diagnostics/ and reported as a detector
+// bug instead.
+export function createStarvationAlertBead(diagnostic: StarvationDiagnostic): void {
+  const validation = validateStarvationAlert(diagnostic);
+  if (!validation.actionable) {
+    console.error(`[starvation] suppressing non-actionable diagnostic: ${validation.reason}`);
+    logStarvationDiagnostic(diagnostic, "starvation-detector-bug");
+    fileDetectorBugBead(validation.reason ?? "unknown", diagnostic);
+    return;
+  }
+
+  const description = `Pluck found no candidates but open beads exist.
 
 **Workspace:** ${diagnostic.workspace}
 **Open beads:** ${diagnostic.open_beads}
@@ -245,9 +336,24 @@ ${diagnostic.recovery_attempts.map(attempt => `- ${attempt}`).join("\n")}
 
 ${diagnostic.error ? `**Error:** ${diagnostic.error}` : ""}`;
 
-    const cmd = `/home/coding/.local/bin/bead create --title "Starvation alert: beads invisible in ${diagnostic.workspace}" --priority 2 --issue-type task --label "alert:starvation:unknown" --label "starvation-alert" --notes "${description.replace(/"/g, '\\"')}"`;
-
-    execSync(cmd, { encoding: "utf-8", timeout: 30000 });
+  try {
+    // argv array, not a shell string: the description carries free-form error
+    // text that must never be reinterpreted by a shell. --description, not
+    // --notes: `bead create` has no --notes flag, so the old command failed
+    // silently inside this try/catch and no alert ever reached the queue.
+    execFileSync(
+      BEAD_BIN,
+      [
+        "create",
+        "--title", `Starvation alert: beads invisible in ${diagnostic.workspace}`,
+        "--priority", "2",
+        "--issue-type", "task",
+        "--label", "alert:starvation:unknown",
+        "--label", "starvation-alert",
+        "--description", description,
+      ],
+      { encoding: "utf-8", timeout: 30000 }
+    );
     console.log("[starvation] alert bead created");
   } catch (err) {
     console.error("[starvation] failed to create alert bead:", err);
@@ -264,7 +370,7 @@ export function startStarvationDetection(intervalMs: number = 60000): void {
       if (diagnostic.recovered) {
         console.log(`[starvation] recovery successful`);
       } else {
-        console.log(`[starvation] recovery failed, alert bead created`);
+        console.log(`[starvation] recovery failed; diagnostic dispatched (alert bead, or detector-bug bead if non-actionable)`);
       }
     }
   }, intervalMs);

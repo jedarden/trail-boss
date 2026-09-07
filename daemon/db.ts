@@ -250,6 +250,12 @@ interface StarvationDiagnostic {
   timestamp: string;
 }
 
+// `bead list` caps results at 100 unless --limit is passed. That default
+// silently truncates a bigger workspace to its oldest — usually closed —
+// issues, which made every count in getStarvationDiagnostic read zero
+// (trailbos-6d972074). Always list with a limit above any real workspace.
+export const BEAD_LIST_LIMIT = 100000;
+
 /**
  * Query the bead database via bead CLI and compute starvation diagnostics.
  *
@@ -264,7 +270,11 @@ export function getStarvationDiagnostic(): StarvationDiagnostic {
   try {
     // Query all beads using the bead CLI
     // Use full path because systemd service doesn't have ~/.local/bin in PATH
-    const beadJson = execSync("/home/coding/.local/bin/bead list --json", { encoding: "utf-8" });
+    // The bead store lives at the workspace root; run there so the query does
+    // not depend on the service WorkingDirectory (the daemon runs from daemon/)
+    const workspace = process.env.PWD || process.cwd();
+    const workspaceRoot = workspace.endsWith("/daemon") ? workspace.slice(0, -7) : workspace;
+    const beadJson = execSync(`cd "${workspaceRoot}" && /home/coding/.local/bin/bead list --json --limit ${BEAD_LIST_LIMIT}`, { encoding: "utf-8" });
 
     // Parse JSON lines (bead list --json outputs one JSON object per line)
     const lines = beadJson.trim().split("\n").filter(line => line.length > 0);
