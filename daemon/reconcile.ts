@@ -8,6 +8,17 @@ import { getSession, dequeue, getSessionsForReconcile, upsertSession, enqueue, g
 // Overridable so tests can point this at a stub CLI (TRAILBOSS_BEAD_BIN).
 const BEAD_BIN = process.env.TRAILBOSS_BEAD_BIN || "/home/coding/.local/bin/bead";
 
+// A worker with no runtime signal newer than this is considered verifiably
+// dead, and beads assigned to it are safe to clear (trailbos-4cca2e94).
+// Overridable so tests can exercise both sides of the window.
+const HEARTBEAT_STALE_MS = parseStaleWindowMs(process.env.TRAILBOSS_HEARTBEAT_STALE_MS, 30 * 60 * 1000);
+
+function parseStaleWindowMs(raw: string | undefined, fallback: number): number {
+  if (!raw) return fallback;
+  const parsed = Number(raw);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
+}
+
 // Real Claude Code transcript entry shape
 interface TranscriptEntry {
   type: string;
@@ -205,6 +216,23 @@ export function loadLastClaimerByBead(filePath: string): Map<string, BeadEventEn
   return byBead;
 }
 
+// Worker -> most recent event of any kind (claim, dispatch, result). Liveness
+// signal #2 for the assignee clearing below: most of this fleet writes events
+// but never heartbeats, so a heartbeat-only check would read live workers as
+// dead.
+export function loadLastEventByWorker(filePath: string): Map<string, BeadEventEntry> {
+  const byWorker = new Map<string, BeadEventEntry>();
+  if (!fs.existsSync(filePath)) return byWorker;
+  try {
+    for (const entry of parseJsonl<BeadEventEntry>(fs.readFileSync(filePath, "utf-8"))) {
+      if (entry?.worker) byWorker.set(entry.worker, entry);
+    }
+  } catch (err) {
+    console.error("[starvation] failed to read bead events:", err);
+  }
+  return byWorker;
+}
+
 // Compact human age for a heartbeat: "42s", "7m", "3h", "12d".
 function formatAge(ageMs: number): string {
   const seconds = Math.max(0, Math.floor(ageMs / 1000));
@@ -217,6 +245,19 @@ function formatAge(ageMs: number): string {
 }
 
 const FINISHED_STATUSES = new Set(["closed", "done"]);
+
+// The `blocks` dependencies of `bead` whose blocker is not finished, with each
+// blocker's status. Shared by the classifier (which names them as causes) and
+// the dead-worker remediation (which needs "assignee is the ONLY exclusion").
+function unclosedBlockers(bead: BeadRecord, statusById: Map<string, string>): Array<{ id: string; status: string }> {
+  const out: Array<{ id: string; status: string }> = [];
+  for (const dep of bead.dependencies ?? []) {
+    if (dep.kind && dep.kind !== "blocks") continue;
+    const status = statusById.get(dep.blocker)?.toLowerCase() ?? "unknown";
+    if (!FINISHED_STATUSES.has(status)) out.push({ id: dep.blocker, status });
+  }
+  return out;
+}
 
 // Classify one excluded bead's invisibility cause from bead data alone — no
 // human judgment, every cause read from fields that already exist.
@@ -272,12 +313,8 @@ export function classifyExcludedBead(
   }
 
   // (c) blocking dependencies: each unclosed blocker, with its status.
-  for (const dep of bead.dependencies ?? []) {
-    if (dep.kind && dep.kind !== "blocks") continue;
-    const blockerStatus = statusById.get(dep.blocker)?.toLowerCase() ?? "unknown";
-    if (!FINISHED_STATUSES.has(blockerStatus)) {
-      base.causes.push(`blocked by ${dep.blocker} (${blockerStatus})`);
-    }
+  for (const blocker of unclosedBlockers(bead, statusById)) {
+    base.causes.push(`blocked by ${blocker.id} (${blocker.status})`);
   }
 
   if (base.causes.length === 0) {
@@ -322,6 +359,142 @@ function recordExclusionNote(bead: BeadRecord, classification: ExcludedBeadClass
   } catch (err) {
     console.error(`[starvation] failed to record classification on ${bead.id}:`, err);
   }
+}
+
+// Newest runtime signal (heartbeat or event) for one worker short name, or
+// null when that worker appears in neither runtime log.
+function workerLastSeenMs(
+  worker: string,
+  heartbeatByWorker: Map<string, HeartbeatEntry>,
+  lastEventByWorker: Map<string, BeadEventEntry>
+): number | null {
+  let newest: number | null = null;
+  const heartbeat = heartbeatByWorker.get(worker);
+  if (heartbeat?.ts) {
+    const ts = parseTimestamp(heartbeat.ts);
+    if (ts > 0 && (newest === null || ts > newest)) newest = ts;
+  }
+  const event = lastEventByWorker.get(worker);
+  if (event?.ts) {
+    const ts = parseTimestamp(event.ts);
+    if (ts > 0 && (newest === null || ts > newest)) newest = ts;
+  }
+  return newest;
+}
+
+// Newest runtime signal across every worker name a bead's assignment maps to,
+// or null when none of them has any recorded signal. Assignees are Claude
+// session names (`claude-code-glm-5.3-flash-glm-acb`) while the runtime logs
+// name fleet workers (`glm-acb`), so besides a direct hit on the assignee
+// itself, the bead's claim event names the worker that took it — the same
+// bridge classifyExcludedBead uses.
+export function resolveBeadWorkerLastSeen(
+  bead: BeadRecord,
+  claimerByBead: Map<string, BeadEventEntry>,
+  heartbeatByWorker: Map<string, HeartbeatEntry>,
+  lastEventByWorker: Map<string, BeadEventEntry>
+): number | null {
+  const assignee = bead.assignee && bead.assignee !== "null" ? bead.assignee : null;
+  if (!assignee) return null;
+
+  let newest: number | null = null;
+  const candidates = new Set<string>([assignee]);
+  const claimedBy = claimerByBead.get(bead.id)?.worker;
+  if (claimedBy) candidates.add(claimedBy);
+  for (const worker of candidates) {
+    const seen = workerLastSeenMs(worker, heartbeatByWorker, lastEventByWorker);
+    if (seen !== null && (newest === null || seen > newest)) newest = seen;
+  }
+  return newest;
+}
+
+// Second mechanical remediation for assigned-but-open starvation
+// (trailbos-4cca2e94): `bead update --clear-assignee`, the documented fix —
+// `bead release` deliberately refuses this state ("use update --clear-assignee
+// instead"), and the 2026-08-16 fleet sweep found 583 beads starved in it.
+//
+// An assignee is cleared only when its worker is VERIFIABLY dead: it has a
+// runtime trail (heartbeat or event) and the newest entry is older than
+// HEARTBEAT_STALE_MS. A worker with no trail at all cannot be verified dead —
+// most of this fleet writes events but no heartbeats — so those beads are left
+// for the alert path rather than cleared on an absence of evidence. Likewise a
+// bead that is in_progress or manually blocked is never a candidate, and
+// neither is one whose exclusion has any other cause (an unclosed blocker):
+// clearing those would not put them on the ready frontier anyway.
+//
+// Returns the number of assignees cleared; every decision lands in
+// diagnostic.recovery_attempts so the alert (when one is still filed) carries
+// the triage.
+export function clearAssigneesOfDeadWorkers(
+  diagnostic: StarvationDiagnostic,
+  workspaceRoot: string,
+  excludedBeads: BeadRecord[],
+  statusById: Map<string, string>,
+  claimerByBead: Map<string, BeadEventEntry>,
+  heartbeatByWorker: Map<string, HeartbeatEntry>,
+  lastEventByWorker: Map<string, BeadEventEntry>,
+  nowMs: number = Date.now()
+): number {
+  const candidates = excludedBeads.filter(bead => {
+    const assignee = bead.assignee && bead.assignee !== "null" ? bead.assignee : null;
+    if (!assignee) return false;
+    // Never clear an in_progress or manually blocked bead, whatever its assignee.
+    const status = (statusById.get(bead.id) ?? bead.status ?? "").toLowerCase();
+    if (status === "in_progress" || bead.manual_blocked) return false;
+    // The assignee must be the bead's ONLY exclusion: no unclosed blocker too.
+    return unclosedBlockers(bead, statusById).length === 0;
+  });
+  if (candidates.length === 0) {
+    diagnostic.recovery_attempts.push("no excluded bead is held back by its assignee alone");
+    return 0;
+  }
+
+  let cleared = 0;
+  for (const bead of candidates) {
+    const assignee = bead.assignee!;
+    const lastSeen = resolveBeadWorkerLastSeen(bead, claimerByBead, heartbeatByWorker, lastEventByWorker);
+    if (lastSeen !== null && nowMs - lastSeen < HEARTBEAT_STALE_MS) {
+      diagnostic.recovery_attempts.push(
+        `bead ${bead.id}: worker ${assignee} signal live (${formatAge(nowMs - lastSeen)} old); assignee kept`
+      );
+      continue;
+    }
+    if (lastSeen === null) {
+      diagnostic.recovery_attempts.push(
+        `bead ${bead.id}: assignee ${assignee} has no heartbeat or event trail; cannot verify the worker is dead; assignee kept`
+      );
+      continue;
+    }
+
+    try {
+      // argv array, not a shell string: ids come from bead JSON and must never
+      // be reinterpreted by a shell (same rule as the alert bead below).
+      execFileSync(BEAD_BIN, ["update", bead.id, "--clear-assignee"], {
+        encoding: "utf-8",
+        timeout: 30000,
+        cwd: workspaceRoot,
+      });
+      cleared++;
+      diagnostic.recovery_attempts.push(
+        `bead ${bead.id}: cleared assignee ${assignee} — worker silent for ${formatAge(nowMs - lastSeen)}`
+      );
+    } catch (err) {
+      const error = err instanceof Error ? err.message : String(err);
+      diagnostic.recovery_attempts.push(`bead ${bead.id}: failed to clear assignee ${assignee}: ${error}`);
+    }
+  }
+  return cleared;
+}
+
+// Count the ready frontier. Each call is a separate snapshot of a live store,
+// so callers compare it only against counts taken for the same decision.
+function countReadyBeads(workspaceRoot: string): number {
+  const result = execSync(`cd "${workspaceRoot}" && ${BEAD_BIN} list --ready --json --limit ${BEAD_LIST_LIMIT} 2>/dev/null`, {
+    encoding: "utf-8",
+    timeout: 10000,
+  });
+  // JSONL format: one bead object per non-empty line
+  return result.trim().split("\n").filter(line => line.trim()).length;
 }
 
 // Detect bead starvation: open beads that aren't visible to pluck (ready frontier)
@@ -388,6 +561,7 @@ export async function detectBeadStarvation(): Promise<StarvationDiagnostic | nul
 
     const heartbeatByWorker = loadLastHeartbeatByWorker(path.join(workspaceRoot, ".beads", "heartbeats.jsonl"));
     const claimerByBead = loadLastClaimerByBead(path.join(workspaceRoot, ".beads", "events.jsonl"));
+    const lastEventByWorker = loadLastEventByWorker(path.join(workspaceRoot, ".beads", "events.jsonl"));
     const nowMs = Date.now();
 
     const classifications = excludedBeads.map(bead => {
@@ -433,15 +607,8 @@ export async function detectBeadStarvation(): Promise<StarvationDiagnostic | nul
       });
       diagnostic.recovery_attempts.push("bead sync flush completed");
 
-      // Re-check after recovery (parse JSONL format)
-      const readyAfterResult = execSync(`cd "${workspaceRoot}" && ${BEAD_BIN} list --ready --json --limit ${BEAD_LIST_LIMIT} 2>/dev/null`, {
-        encoding: "utf-8",
-        timeout: 10000,
-      });
-      // Parse JSONL format: split by newlines and parse each line as a JSON object
-      const readyAfterCount = readyAfterResult.trim().split('\n').filter(line => line.trim()).map(line => JSON.parse(line)).length;
-
-      if (readyAfterCount === openCount) {
+      // Re-check after recovery
+      if (countReadyBeads(workspaceRoot) === openCount) {
         diagnostic.recovered = true;
         diagnostic.recovery_attempts.push("starvation resolved after sync flush");
       }
@@ -449,6 +616,40 @@ export async function detectBeadStarvation(): Promise<StarvationDiagnostic | nul
       const error = err instanceof Error ? err.message : String(err);
       diagnostic.error = error;
       diagnostic.recovery_attempts.push(`recovery failed: ${error}`);
+    }
+
+    // Second remediation (trailbos-4cca2e94): the flush only fixes checkpoint
+    // lag. Assigned-but-open starvation has a different fix — clear the
+    // assignee — but only when the worker behind it is verifiably dead.
+    if (!diagnostic.recovered) {
+      const cleared = clearAssigneesOfDeadWorkers(
+        diagnostic,
+        workspaceRoot,
+        excludedBeads,
+        statusById,
+        claimerByBead,
+        heartbeatByWorker,
+        lastEventByWorker,
+        nowMs
+      );
+      if (cleared > 0) {
+        try {
+          const readyAfterClear = countReadyBeads(workspaceRoot);
+          if (readyAfterClear > readyCount) {
+            diagnostic.recovered = true;
+            diagnostic.recovery_attempts.push(
+              `starvation resolved after clearing dead-worker assignees (ready ${readyCount} -> ${readyAfterClear})`
+            );
+          } else {
+            diagnostic.recovery_attempts.push(
+              `ready frontier unchanged after clearing dead-worker assignees (${readyAfterClear})`
+            );
+          }
+        } catch (err) {
+          const error = err instanceof Error ? err.message : String(err);
+          diagnostic.recovery_attempts.push(`ready frontier re-check failed: ${error}`);
+        }
+      }
     }
 
     // Log diagnostic payload

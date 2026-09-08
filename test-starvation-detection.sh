@@ -11,6 +11,7 @@ DAEMON_URL="http://127.0.0.1:${DAEMON_PORT}"
 DATA_DIR="$(mktemp -d /tmp/tb-starvation-data.XXXXXX)"
 TEST_BASE="tb-starvation-$$"
 REGRESSION_DIR=""
+RECOVERY_DIR=""
 DAEMON_PID=""
 
 # Add bun to PATH
@@ -26,6 +27,9 @@ cleanup() {
   rm -rf ".beads/diagnostics" 2>/dev/null || true
   if [ -n "$REGRESSION_DIR" ]; then
     rm -rf "$REGRESSION_DIR" 2>/dev/null || true
+  fi
+  if [ -n "$RECOVERY_DIR" ]; then
+    rm -rf "$RECOVERY_DIR" 2>/dev/null || true
   fi
 }
 trap cleanup EXIT
@@ -345,6 +349,264 @@ fi
 echo "[PASS] detector-bug bead filed in place of the suppressed alert"
 echo ""
 
+# Test 8: heartbeat-gated assignee clearing (trailbos-4cca2e94).
+# The detector's second remediation clears an assignee only when the worker
+# behind it is verifiably dead — a heartbeat or event trail older than the
+# staleness window (30min). Required cases: a live worker's bead is not
+# cleared, a dead worker's bead is cleared and becomes ready, and an
+# in_progress bead is never cleared no matter how dead its worker looks.
+# Also covered: an assignee that is not the bead's only exclusion (unclosed
+# blocker) is left alone, a worker alive on events alone is not cleared, and a
+# workspace where nothing qualifies falls through to the alert path.
+echo "[test-8] Testing heartbeat-gated assignee clearing (trailbos-4cca2e94)..."
+
+RECOVERY_DIR="$(mktemp -d /tmp/tb-starvation-recovery.XXXXXX)"
+SCENARIO_A="$RECOVERY_DIR/scenario-a"
+SCENARIO_B="$RECOVERY_DIR/scenario-b"
+STALE_TS="$(date -u -d '3 hours ago' +%Y-%m-%dT%H:%M:%S)+00:00"
+FRESH_TS="$(date -u -d '90 seconds ago' +%Y-%m-%dT%H:%M:%S)+00:00"
+
+mkdir -p "$SCENARIO_A/.beads" "$SCENARIO_B/.beads"
+
+# ---------------------------------------------------------------------------
+# Fixture bead CLI: answers `bead list` from scenario fixtures, records
+# mutations. A `--clear-assignee` call is logged as CLEAR <id> and flips the
+# stub's ready frontier: the cleared bead becomes visible to pluck, exactly
+# what the real CLI does with the assignee gone.
+# ---------------------------------------------------------------------------
+write_recovery_stub() {
+  local dir="$1" log="$2"
+  cat > "$dir/bead-stub" <<STUB
+#!/usr/bin/env bash
+LOG="$log"
+case "\$1" in
+  update)
+    if [[ "\$*" == *"--clear-assignee"* ]]; then
+      printf 'CLEAR %s\n' "\$2" >> "\$LOG"
+      touch "$dir/cleared"
+    else
+      printf 'UPDATE %s\n' "\$2" >> "\$LOG"
+    fi
+    exit 0 ;;
+  create)
+    printf 'CREATE %s\n' "\$*" >> "\$LOG"
+    exit 0 ;;
+  list)
+    printf 'bead %s\n' "\$*" >> "\$LOG"
+    case "\$*" in
+      *" --ready"*)
+        # Ready frontier: empty until a clear actually happened
+        if [ -f "$dir/cleared" ]; then cat "$dir/fixtures-ready.jsonl"; fi
+        ;;
+      *" --status open"*) cat "$dir/fixtures-open.jsonl" ;;
+      *"list --json"*) cat "$dir/fixtures-all.jsonl" ;;
+    esac
+    exit 0 ;;
+  *)
+    printf 'bead %s\n' "\$*" >> "\$LOG"
+    exit 0 ;;
+esac
+exit 0
+STUB
+  chmod +x "$dir/bead-stub"
+}
+
+# ---------------------------------------------------------------------------
+# Scenario A: one of each kind of excluded bead
+# ---------------------------------------------------------------------------
+# Assignees use the workspace's real shape (claude session name, worker short
+# name as the last dash segment) so resolution must go through the claim event.
+cat > "$SCENARIO_A/.beads/heartbeats.jsonl" <<EOF
+{"worker":"glm-live","state":"idle","ts":"${FRESH_TS}","last_strand":null}
+{"worker":"glm-evlive","state":"idle","ts":"${STALE_TS}","last_strand":null}
+{"worker":"glm-dead","state":"idle","ts":"${STALE_TS}","last_strand":null}
+{"worker":"glm-wip","state":"idle","ts":"${STALE_TS}","last_strand":null}
+EOF
+# glm-evlive's only fresh signal is an event: stale heartbeat, live worker.
+cat > "$SCENARIO_A/.beads/events.jsonl" <<EOF
+{"bead":"tb-tst-live","event":"claim","worker":"glm-live","ts":"${STALE_TS}"}
+{"bead":"tb-tst-evlive","event":"claim","worker":"glm-evlive","ts":"${STALE_TS}"}
+{"bead":"tb-tst-evlive","event":"result","worker":"glm-evlive","ts":"${FRESH_TS}"}
+{"bead":"tb-tst-dead","event":"claim","worker":"glm-dead","ts":"${STALE_TS}"}
+{"bead":"tb-tst-wip","event":"claim","worker":"glm-wip","ts":"${STALE_TS}"}
+{"bead":"tb-tst-blocked","event":"claim","worker":"glm-dead","ts":"${STALE_TS}"}
+EOF
+cat > "$SCENARIO_A/fixtures-open.jsonl" <<'EOF'
+{"id":"tb-tst-ready","title":"visible bead","status":"open","assignee":null,"manual_blocked":false,"dependencies":[],"notes":""}
+{"id":"tb-tst-live","title":"live worker","status":"open","assignee":"claude-code-glm-5.3-flash-glm-live","manual_blocked":false,"dependencies":[],"notes":""}
+{"id":"tb-tst-evlive","title":"event-live worker","status":"open","assignee":"claude-code-glm-5.3-flash-glm-evlive","manual_blocked":false,"dependencies":[],"notes":""}
+{"id":"tb-tst-dead","title":"dead worker","status":"open","assignee":"claude-code-glm-5.3-flash-glm-dead","manual_blocked":false,"dependencies":[],"notes":""}
+{"id":"tb-tst-wip","title":"claimed mid-scan","status":"open","assignee":"claude-code-glm-5.3-flash-glm-wip","manual_blocked":false,"dependencies":[],"notes":""}
+{"id":"tb-tst-blocked","title":"also blocked","status":"open","assignee":"claude-code-glm-5.3-flash-glm-dead","manual_blocked":false,"dependencies":[{"blocker":"tb-tst-blocker","kind":"blocks"}],"notes":""}
+EOF
+# The full list is the fresher read: tb-tst-wip was claimed between snapshots.
+cat > "$SCENARIO_A/fixtures-all.jsonl" <<'EOF'
+{"id":"tb-tst-ready","title":"visible bead","status":"open","assignee":null,"dependencies":[],"notes":""}
+{"id":"tb-tst-live","title":"live worker","status":"open","assignee":"claude-code-glm-5.3-flash-glm-live","dependencies":[],"notes":""}
+{"id":"tb-tst-evlive","title":"event-live worker","status":"open","assignee":"claude-code-glm-5.3-flash-glm-evlive","dependencies":[],"notes":""}
+{"id":"tb-tst-dead","title":"dead worker","status":"open","assignee":"claude-code-glm-5.3-flash-glm-dead","dependencies":[],"notes":""}
+{"id":"tb-tst-wip","title":"claimed mid-scan","status":"in_progress","assignee":"claude-code-glm-5.3-flash-glm-wip","dependencies":[],"notes":""}
+{"id":"tb-tst-blocked","title":"also blocked","status":"open","assignee":"claude-code-glm-5.3-flash-glm-dead","dependencies":[{"blocker":"tb-tst-blocker","kind":"blocks"}],"notes":""}
+{"id":"tb-tst-blocker","title":"unclosed blocker","status":"open","assignee":null,"dependencies":[],"notes":""}
+EOF
+# The ready frontier once the stub has seen the clear: the dead worker's bead,
+# assignee gone. Before any clear the stub cats nothing (empty frontier).
+echo '{"id":"tb-tst-dead","title":"dead worker","status":"open","assignee":null,"dependencies":[],"notes":""}' > "$SCENARIO_A/fixtures-ready.jsonl"
+
+cat > "$RECOVERY_DIR/recovery.ts" <<'TS'
+const daemonDir = process.env.TB_DAEMON_DIR + "/reconcile.ts";
+const scenarioDir = process.env.TB_SCENARIO_DIR!;
+let failures = 0;
+function assert(cond: boolean, msg: string): void {
+  if (cond) {
+    console.log("  [ok] " + msg);
+  } else {
+    console.error("  [FAIL] " + msg);
+    failures++;
+  }
+}
+
+const fs = await import("fs");
+process.chdir(scenarioDir); // workspaceRoot and the diagnostics dir resolve from CWD
+const {
+  detectBeadStarvation,
+  loadLastHeartbeatByWorker,
+  loadLastClaimerByBead,
+  loadLastEventByWorker,
+  resolveBeadWorkerLastSeen,
+} = await import(daemonDir);
+
+// Part 1 — unit: worker resolution and the liveness union
+console.log("  [part-1] worker resolution");
+const heartbeats = loadLastHeartbeatByWorker(scenarioDir + "/.beads/heartbeats.jsonl");
+const claimers = loadLastClaimerByBead(scenarioDir + "/.beads/events.jsonl");
+const eventsByWorker = loadLastEventByWorker(scenarioDir + "/.beads/events.jsonl");
+
+const claudeAssignee = "claude-code-glm-5.3-flash-glm-dead";
+const seenViaClaim = resolveBeadWorkerLastSeen(
+  { id: "tb-tst-dead", title: "dead worker", status: "open", assignee: claudeAssignee, dependencies: [] },
+  claimers, heartbeats, eventsByWorker
+);
+const staleMs = Date.now() - 3 * 60 * 60 * 1000;
+assert(seenViaClaim !== null && Math.abs(seenViaClaim! - staleMs) < 60_000,
+  "claude-style assignee resolves to its claimer worker's heartbeat");
+
+const evliveSeen = resolveBeadWorkerLastSeen(
+  { id: "tb-tst-evlive", title: "event-live worker", status: "open", assignee: "claude-code-glm-5.3-flash-glm-evlive", dependencies: [] },
+  claimers, heartbeats, eventsByWorker
+);
+assert(evliveSeen !== null && Date.now() - evliveSeen! < 5 * 60 * 1000,
+  "a fresh event keeps a worker alive despite a stale heartbeat");
+
+assert(resolveBeadWorkerLastSeen(
+  { id: "tb-tst-ghost", title: "ghost", status: "open", assignee: "claude-code-glm-5.3-flash-glm-ghost", dependencies: [] },
+  claimers, heartbeats, eventsByWorker
+) === null, "a worker with no trail anywhere resolves to null (cannot verify death)");
+
+// Part 2 — end-to-end: only the verifiably dead worker's bead is cleared
+console.log("  [part-2] clearing decisions");
+const diag = await detectBeadStarvation();
+assert(diag !== null, "diagnostic produced for excluded beads");
+assert(diag!.recovered === true, "starvation recovered once the dead worker's bead returned to the frontier");
+
+const attempts = diag!.recovery_attempts.join("\n");
+assert(attempts.includes("ready 0 -> 1"), "recovery records the ready count rising: " +
+  (attempts.match(/ready \d+ -> \d+/)?.[0] ?? "no rise recorded"));
+
+const stubLog = fs.readFileSync(process.env.TB_STUB_LOG!, "utf-8");
+const cleared = [...stubLog.matchAll(/^CLEAR (\S+)$/gm)].map(m => m[1]);
+assert(cleared.length === 1 && cleared[0] === "tb-tst-dead",
+  `exactly one assignee cleared, the dead worker's (${cleared.join(", ") || "none"})`);
+assert(!stubLog.includes("CLEAR tb-tst-live"), "live worker's assignee not cleared");
+assert(!stubLog.includes("CLEAR tb-tst-evlive"), "event-live worker's assignee not cleared");
+assert(!stubLog.includes("CLEAR tb-tst-wip"), "in_progress bead's assignee never cleared");
+assert(!stubLog.includes("CLEAR tb-tst-blocked"), "assignee that is not the only exclusion not cleared");
+
+assert(attempts.includes("signal live") && attempts.includes("tb-tst-live"),
+  "live worker decision recorded for the alert triage: " +
+  (attempts.match(/bead tb-tst-live: .*$/m)?.[0] ?? "nothing recorded"));
+assert(attempts.includes("tb-tst-evlive"), "event-live worker decision recorded");
+assert(!stubLog.includes("CREATE "), "no alert bead filed when recovery succeeded");
+
+if (failures > 0) process.exit(1);
+TS
+
+write_recovery_stub "$SCENARIO_A" "$RECOVERY_DIR/stub-a.log"
+echo "  [scenario-a] live / event-live / dead / in_progress / blocked beads"
+(
+  cd "$SCENARIO_A"
+  TRAILBOSS_BEAD_BIN="$SCENARIO_A/bead-stub" \
+  TB_DAEMON_DIR="$TB_DIR/daemon" \
+  TB_SCENARIO_DIR="$SCENARIO_A" \
+  TB_STUB_LOG="$RECOVERY_DIR/stub-a.log" \
+    bun "$RECOVERY_DIR/recovery.ts"
+)
+echo "[PASS] scenario A: dead worker cleared and ready, live/in_progress/blocked assignees kept"
+
+# ---------------------------------------------------------------------------
+# Scenario B: nothing qualifies — every excluded bead has a live worker, so
+# the detector must fall through to the existing alert path unchanged
+# ---------------------------------------------------------------------------
+cat > "$SCENARIO_B/.beads/heartbeats.jsonl" <<EOF
+{"worker":"glm-liveonly","state":"working","ts":"${FRESH_TS}","last_strand":null}
+EOF
+cat > "$SCENARIO_B/.beads/events.jsonl" <<EOF
+{"bead":"tb-tst-liveonly","event":"claim","worker":"glm-liveonly","ts":"${FRESH_TS}"}
+EOF
+cat > "$SCENARIO_B/fixtures-open.jsonl" <<'EOF'
+{"id":"tb-tst-liveonly","title":"only bead, live worker","status":"open","assignee":"claude-code-glm-5.3-flash-glm-liveonly","manual_blocked":false,"dependencies":[],"notes":""}
+EOF
+cat > "$SCENARIO_B/fixtures-all.jsonl" <<'EOF'
+{"id":"tb-tst-liveonly","title":"only bead, live worker","status":"open","assignee":"claude-code-glm-5.3-flash-glm-liveonly","dependencies":[],"notes":""}
+EOF
+: > "$SCENARIO_B/fixtures-ready.jsonl"
+
+cat > "$RECOVERY_DIR/fallthrough.ts" <<'TS'
+const daemonDir = process.env.TB_DAEMON_DIR + "/reconcile.ts";
+const scenarioDir = process.env.TB_SCENARIO_DIR!;
+let failures = 0;
+function assert(cond: boolean, msg: string): void {
+  if (cond) {
+    console.log("  [ok] " + msg);
+  } else {
+    console.error("  [FAIL] " + msg);
+    failures++;
+  }
+}
+
+const fs = await import("fs");
+process.chdir(scenarioDir);
+const { detectBeadStarvation } = await import(daemonDir);
+
+const diag = await detectBeadStarvation();
+assert(diag !== null && diag!.recovered === false, "nothing recovered when the only worker is live");
+
+const stubLog = fs.readFileSync(process.env.TB_STUB_LOG!, "utf-8");
+assert(!stubLog.includes("CLEAR "), "no assignee cleared while the worker is live");
+assert(diag!.recovery_attempts.some(a => a.includes("signal live") && a.includes("tb-tst-liveonly")),
+  "live-worker decision recorded in recovery attempts");
+
+const createIdx = stubLog.indexOf("CREATE ");
+assert(createIdx !== -1, "detector falls through to the alert path when nothing qualifies");
+assert(stubLog.slice(createIdx).includes("alert:starvation:unknown"), "alert carries the triage label");
+assert(stubLog.slice(createIdx).includes("signal live"), "alert description carries the per-bead triage");
+
+if (failures > 0) process.exit(1);
+TS
+
+write_recovery_stub "$SCENARIO_B" "$RECOVERY_DIR/stub-b.log"
+echo "  [scenario-b] single live-worker bead, nothing qualifies"
+(
+  cd "$SCENARIO_B"
+  TRAILBOSS_BEAD_BIN="$SCENARIO_B/bead-stub" \
+  TB_DAEMON_DIR="$TB_DIR/daemon" \
+  TB_SCENARIO_DIR="$SCENARIO_B" \
+  TB_STUB_LOG="$RECOVERY_DIR/stub-b.log" \
+    bun "$RECOVERY_DIR/fallthrough.ts"
+)
+echo "[PASS] scenario B: nothing cleared, alert path carries the triage"
+echo ""
+
 # Summary
 echo "=== Test Summary ==="
 echo "✓ Endpoint structure valid"
@@ -354,5 +616,6 @@ echo "✓ Invisible beads have detailed reasons"
 echo "✓ Diagnostic persistence works"
 echo "✓ Error handling graceful"
 echo "✓ Zero-field alerts suppressed (trailbos-317b7ae2 regression)"
+echo "✓ Dead-worker assignees cleared, live/in_progress/blocked kept (trailbos-4cca2e94)"
 echo ""
 echo "[SUCCESS] All starvation detection tests passed!"
