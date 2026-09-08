@@ -1,5 +1,6 @@
 // Transcript reconcile loop: the transcript JSONL is ground truth
 import * as fs from "fs";
+import * as path from "path";
 import { execFileSync, execSync } from "child_process";
 import { getSession, dequeue, getSessionsForReconcile, upsertSession, enqueue, getSessionsNotInQueue, BEAD_LIST_LIMIT } from "./db.ts";
 
@@ -111,6 +112,218 @@ interface StarvationDiagnostic {
   error?: string;
 }
 
+// One bead as returned by `bead list --json` (JSONL, one object per line).
+// Only the fields the exclusion classifier reads are declared; the CLI emits more.
+interface BeadRecord {
+  id: string;
+  title: string;
+  status: string;
+  assignee?: string | null;
+  manual_blocked?: boolean;
+  dependencies?: Array<{ blocker: string; kind: string }>;
+  notes?: string | null;
+}
+
+// One line of .beads/heartbeats.jsonl — worker liveness, appended by the fleet
+// harness. Append-only, so a worker's most recent entry is its last line.
+interface HeartbeatEntry {
+  worker: string;
+  state: string;
+  ts: string;
+  last_strand?: string | null;
+}
+
+// One line of .beads/events.jsonl — claim/dispatch audit events. These are the
+// mechanical link between the two naming schemes this workspace uses: beads
+// carry Claude session assignees (`claude-code-*`) while heartbeats name fleet
+// workers (`glm-*`), and a claim event names both for the same bead.
+interface BeadEventEntry {
+  bead?: string;
+  event?: string;
+  worker?: string;
+  ts?: string;
+}
+
+// The mechanically-derived reason a bead is not on the ready frontier.
+// `known` is false only when every field the classifier reads came back
+// unremarkable — that residue is exactly what `alert:starvation:unknown`
+// exists for.
+export interface ExcludedBeadClassification {
+  bead_id: string;
+  title: string;
+  status: string;
+  assignee: string | null;
+  causes: string[];
+  known: boolean;
+}
+
+// Parse JSONL defensively: malformed lines are skipped, not fatal — the
+// heartbeat and event files are runtime append logs, not contracts.
+function parseJsonl<T>(content: string): T[] {
+  const out: T[] = [];
+  for (const line of content.split("\n")) {
+    const trimmed = line.trim();
+    if (!trimmed) continue;
+    try {
+      out.push(JSON.parse(trimmed) as T);
+    } catch {
+      continue;
+    }
+  }
+  return out;
+}
+
+// Worker -> most recent heartbeat. Read on every starvation detection, so it
+// tolerates the file not existing yet (fresh workspace).
+export function loadLastHeartbeatByWorker(filePath: string): Map<string, HeartbeatEntry> {
+  const byWorker = new Map<string, HeartbeatEntry>();
+  if (!fs.existsSync(filePath)) return byWorker;
+  try {
+    for (const entry of parseJsonl<HeartbeatEntry>(fs.readFileSync(filePath, "utf-8"))) {
+      if (entry?.worker) byWorker.set(entry.worker, entry);
+    }
+  } catch (err) {
+    console.error("[starvation] failed to read heartbeats:", err);
+  }
+  return byWorker;
+}
+
+// Bead id -> worker that most recently claimed it. Assignee names and
+// heartbeat worker names never match in this workspace (verified 2026-09-08:
+// 21 distinct assignees, all `claude-code-*`; heartbeat workers, all `glm-*`),
+// so the claim event is how an in_progress bead finds the heartbeat to report.
+export function loadLastClaimerByBead(filePath: string): Map<string, BeadEventEntry> {
+  const byBead = new Map<string, BeadEventEntry>();
+  if (!fs.existsSync(filePath)) return byBead;
+  try {
+    for (const entry of parseJsonl<BeadEventEntry>(fs.readFileSync(filePath, "utf-8"))) {
+      if (entry?.event === "claim" && entry.bead && entry.worker) byBead.set(entry.bead, entry);
+    }
+  } catch (err) {
+    console.error("[starvation] failed to read bead events:", err);
+  }
+  return byBead;
+}
+
+// Compact human age for a heartbeat: "42s", "7m", "3h", "12d".
+function formatAge(ageMs: number): string {
+  const seconds = Math.max(0, Math.floor(ageMs / 1000));
+  if (seconds < 60) return `${seconds}s`;
+  const minutes = Math.floor(seconds / 60);
+  if (minutes < 60) return `${minutes}m`;
+  const hours = Math.floor(minutes / 60);
+  if (hours < 24) return `${hours}h`;
+  return `${Math.floor(hours / 24)}d`;
+}
+
+const FINISHED_STATUSES = new Set(["closed", "done"]);
+
+// Classify one excluded bead's invisibility cause from bead data alone — no
+// human judgment, every cause read from fields that already exist.
+// Precedence: manual_blocked is deliberate and ends the classification; an
+// in_progress bead reports its worker's heartbeat; an open bead reports a
+// dead-assignee candidate and/or its unclosed blockers.
+export function classifyExcludedBead(
+  bead: BeadRecord,
+  statusById: Map<string, string>,
+  heartbeatByWorker: Map<string, HeartbeatEntry>,
+  claimerByBead: Map<string, BeadEventEntry>,
+  nowMs: number
+): ExcludedBeadClassification {
+  const status = (bead.status ?? "").toLowerCase();
+  const assignee = bead.assignee && bead.assignee !== "null" ? bead.assignee : null;
+  const base: ExcludedBeadClassification = {
+    bead_id: bead.id,
+    title: bead.title,
+    status,
+    assignee,
+    causes: [],
+    known: true,
+  };
+
+  // (d) manual_blocked: the flag is deliberate — record it and skip the dig.
+  if (bead.manual_blocked) {
+    base.causes = ["manually blocked (deliberate flag; not classified further)"];
+    return base;
+  }
+
+  // (a) in_progress: report the worker's most recent heartbeat, state and age.
+  // The direct assignee->worker lookup rarely matches in this workspace (see
+  // loadLastClaimerByBead), so fall back to whoever claimed the bead.
+  if (status === "in_progress") {
+    const claimedBy = claimerByBead.get(bead.id);
+    const worker = (assignee && heartbeatByWorker.has(assignee) ? assignee : null)
+      ?? (claimedBy && heartbeatByWorker.has(claimedBy.worker) ? claimedBy.worker : null);
+    if (worker) {
+      const hb = heartbeatByWorker.get(worker)!;
+      const ageMs = nowMs - parseTimestamp(hb.ts);
+      base.causes = [`in_progress: worker ${worker} last heartbeat state=${hb.state} ${formatAge(ageMs)} ago`];
+    } else if (assignee) {
+      base.causes = [`in_progress assigned to ${assignee}; no heartbeat recorded for that worker`];
+    } else {
+      base.causes = ["in_progress with no assignee and no recorded heartbeat"];
+    }
+    return base;
+  }
+
+  // (b) open with an assignee: nothing will claim it — dead-assignee candidate.
+  if (assignee) {
+    base.causes.push(`open but assigned to ${assignee} (dead-assignee candidate)`);
+  }
+
+  // (c) blocking dependencies: each unclosed blocker, with its status.
+  for (const dep of bead.dependencies ?? []) {
+    if (dep.kind && dep.kind !== "blocks") continue;
+    const blockerStatus = statusById.get(dep.blocker)?.toLowerCase() ?? "unknown";
+    if (!FINISHED_STATUSES.has(blockerStatus)) {
+      base.causes.push(`blocked by ${dep.blocker} (${blockerStatus})`);
+    }
+  }
+
+  if (base.causes.length === 0) {
+    base.causes = ["no mechanical cause identified (open, unassigned, no unclosed blockers)"];
+    base.known = false;
+  }
+  return base;
+}
+
+// Bead id -> cause-set already recorded on that bead this process. The
+// detector runs every 60s; without this memo a long-lived daemon would stamp
+// the identical classification onto the same bead every interval.
+const recordedExclusionCauses = new Map<string, string>();
+
+// Append the classification to the bead's notes. `bead update --notes`
+// REPLACES the field rather than appending (verified against bead-rs
+// 2026-09-08), so the existing notes are read from the same full-list snapshot
+// that fed the classifier and rewritten with the classification appended.
+// When existing notes cannot be read the write is skipped entirely — losing an
+// operator's notes would be a worse mutation than missing one diagnostic line.
+// Nothing else is ever mutated: no status, assignee, or dependency changes.
+function recordExclusionNote(bead: BeadRecord, classification: ExcludedBeadClassification): void {
+  const causeSet = classification.causes.join("; ");
+  if (recordedExclusionCauses.get(bead.id) === causeSet) return;
+
+  const existing = (bead.notes ?? "").trim();
+  if (bead.notes === undefined || bead.notes === null) {
+    console.error(`[starvation] skipping note on ${bead.id}: existing notes unreadable, refusing to replace`);
+    return;
+  }
+  const line = `starvation classification (${new Date().toISOString()}): ${causeSet}`;
+  const merged = existing ? `${existing}\n\n${line}` : line;
+
+  try {
+    // argv array, not a shell string: notes are free-form text and must never
+    // be reinterpreted by a shell (same rule as the alert bead below).
+    execFileSync(BEAD_BIN, ["update", bead.id, "--notes", merged], {
+      encoding: "utf-8",
+      timeout: 30000,
+    });
+    recordedExclusionCauses.set(bead.id, causeSet);
+  } catch (err) {
+    console.error(`[starvation] failed to record classification on ${bead.id}:`, err);
+  }
+}
+
 // Detect bead starvation: open beads that aren't visible to pluck (ready frontier)
 export async function detectBeadStarvation(): Promise<StarvationDiagnostic | null> {
   try {
@@ -126,7 +339,7 @@ export async function detectBeadStarvation(): Promise<StarvationDiagnostic | nul
       timeout: 10000,
     });
     // Parse JSONL format: split by newlines and parse each line as a JSON object
-    const openBeads = openResult.trim().split('\n').filter(line => line.trim()).map(line => JSON.parse(line));
+    const openBeads: BeadRecord[] = openResult.trim().split('\n').filter(line => line.trim()).map(line => JSON.parse(line));
 
     // Get ready (pluck-visible) bead count (parse JSONL format)
     const readyResult = execSync(`cd "${workspaceRoot}" && ${BEAD_BIN} list --ready --json --limit ${BEAD_LIST_LIMIT} 2>/dev/null`, {
@@ -134,11 +347,18 @@ export async function detectBeadStarvation(): Promise<StarvationDiagnostic | nul
       timeout: 10000,
     });
     // Parse JSONL format: split by newlines and parse each line as a JSON object
-    const readyBeads = readyResult.trim().split('\n').filter(line => line.trim()).map(line => JSON.parse(line));
+    const readyBeads: BeadRecord[] = readyResult.trim().split('\n').filter(line => line.trim()).map(line => JSON.parse(line));
+
+    // Diff the ID sets rather than subtracting counts: the two CLI calls are
+    // separate snapshots of a live store, and a bead claimed or closed between
+    // them would otherwise make ready_beads + excluded_beads != open_beads —
+    // which validateStarvationAlert rejects and would misfile as a detector bug.
+    const readyIds = new Set(readyBeads.map(bead => bead.id));
+    const excludedBeads = openBeads.filter(bead => !readyIds.has(bead.id));
 
     const openCount = openBeads.length;
-    const readyCount = readyBeads.length;
-    const excludedCount = openCount - readyCount;
+    const readyCount = openCount - excludedBeads.length;
+    const excludedCount = excludedBeads.length;
 
     // No starvation if there are no open beads, or if all open beads are ready
     if (openCount === 0 || excludedCount === 0) {
@@ -147,19 +367,51 @@ export async function detectBeadStarvation(): Promise<StarvationDiagnostic | nul
 
     console.log(`[starvation] detected: ${openCount} open beads, ${readyCount} ready beads, ${excludedCount} excluded`);
 
-    // Analyze exclusion reasons (bead list --json returns already-parsed objects)
-    const exclusionReasons: string[] = [];
-    for (const bead of openBeads) {
-      if (bead.assignee && bead.assignee !== "null") {
-        exclusionReasons.push(`bead ${bead.id} assigned to ${bead.assignee}`);
+    // Classify each excluded bead mechanically (trailbos-ba86503f) instead of
+    // leaving exclusion_reasons to guess at. The full list supplies blocker
+    // statuses and the notes each classification must append to — one call
+    // covers both, and its failures degrade to classification without notes.
+    const statusById = new Map<string, string>();
+    const notesById = new Map<string, string>();
+    try {
+      const allResult = execSync(`cd "${workspaceRoot}" && ${BEAD_BIN} list --json --limit ${BEAD_LIST_LIMIT} 2>/dev/null`, {
+        encoding: "utf-8",
+        timeout: 10000,
+      });
+      for (const bead of parseJsonl<BeadRecord>(allResult)) {
+        statusById.set(bead.id, bead.status ?? "unknown");
+        notesById.set(bead.id, bead.notes ?? "");
       }
-      if (bead.manual_blocked) {
-        exclusionReasons.push(`bead ${bead.id} manually blocked`);
-      }
-      if (bead.status === "in_progress") {
-        exclusionReasons.push(`bead ${bead.id} in progress`);
-      }
+    } catch (err) {
+      console.error("[starvation] full bead list unavailable; blocker statuses will read unknown:", err);
     }
+
+    const heartbeatByWorker = loadLastHeartbeatByWorker(path.join(workspaceRoot, ".beads", "heartbeats.jsonl"));
+    const claimerByBead = loadLastClaimerByBead(path.join(workspaceRoot, ".beads", "events.jsonl"));
+    const nowMs = Date.now();
+
+    const classifications = excludedBeads.map(bead => {
+      // The full list is the fresher read: a bead claimed between the open and
+      // ready snapshots classifies by its real status, not the stale one.
+      const freshStatus = statusById.get(bead.id);
+      const beadForClassification: BeadRecord = freshStatus !== undefined ? { ...bead, status: freshStatus } : bead;
+      return classifyExcludedBead(
+        beadForClassification,
+        statusById,
+        heartbeatByWorker,
+        claimerByBead,
+        nowMs
+      );
+    });
+
+    for (const classification of classifications) {
+      if (!classification.known) continue; // unknown causes belong on the alert, not on the bead
+      const bead = excludedBeads.find(b => b.id === classification.bead_id)!;
+      const notes = notesById.get(bead.id);
+      recordExclusionNote({ ...bead, notes }, classification);
+    }
+
+    const exclusionReasons = classifications.map(c => `bead ${c.bead_id}: ${c.causes.join("; ")}`);
 
     const diagnostic: StarvationDiagnostic = {
       timestamp,
