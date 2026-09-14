@@ -1149,3 +1149,6 @@
 {"bead":"trailbos-383d1150","duration_ms":3601644,"event":"timeout","exit_code":124,"outcome":"timeout","strand":"pluck","ts":"2026-09-08T21:26:22.779212083+00:00","worker":"glm-trail"}
 {"bead":"trailbos-4cca2e94","event":"claim","strand":"explore","ts":"2026-09-14T10:39:24.229405622+00:00","worker":"glm-tradegraph"}
 {"adapter":"claude-code-glm-5.3","attempt_id":"01a09f80-0d59-7fa0-af36-f16ec76eb9ba","bead":"trailbos-4cca2e94","event":"dispatch","model":"glm-5.3","strand":"explore","ts":"2026-09-14T10:39:24.505835020+00:00","worker":"glm-tradegraph"}
+{"bead":"trailbos-4cca2e94","duration_ms":1047224,"event":"complete","exit_code":0,"outcome":"success","strand":"explore","ts":"2026-09-14T10:56:51.759224127+00:00","worker":"glm-tradegraph"}
+{"bead":"trailbos-383d1150","event":"claim","strand":"explore","ts":"2026-09-14T11:15:56.763265946+00:00","worker":"glm-roam-23"}
+{"adapter":"claude-code-glm-5.3","attempt_id":"01a09fa1-81d7-7820-8767-c00a941a00b9","bead":"trailbos-383d1150","event":"dispatch","model":"glm-5.3","strand":"explore","ts":"2026-09-14T11:15:57.015548565+00:00","worker":"glm-roam-23"}
