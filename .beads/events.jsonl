@@ -1147,3 +1147,5 @@
 {"bead":"trailbos-383d1150","event":"claim","strand":"pluck","ts":"2026-09-08T20:26:20.634872078+00:00","worker":"glm-trail"}
 {"adapter":"claude-code-glm-5.3-flash","bead":"trailbos-383d1150","event":"dispatch","model":"glm-5.3-flash","strand":"pluck","ts":"2026-09-08T20:26:21.015851270+00:00","worker":"glm-trail"}
 {"bead":"trailbos-383d1150","duration_ms":3601644,"event":"timeout","exit_code":124,"outcome":"timeout","strand":"pluck","ts":"2026-09-08T21:26:22.779212083+00:00","worker":"glm-trail"}
+{"bead":"trailbos-4cca2e94","event":"claim","strand":"explore","ts":"2026-09-14T10:39:24.229405622+00:00","worker":"glm-tradegraph"}
+{"adapter":"claude-code-glm-5.3","attempt_id":"01a09f80-0d59-7fa0-af36-f16ec76eb9ba","bead":"trailbos-4cca2e94","event":"dispatch","model":"glm-5.3","strand":"explore","ts":"2026-09-14T10:39:24.505835020+00:00","worker":"glm-tradegraph"}
