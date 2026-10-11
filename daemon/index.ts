@@ -5,6 +5,7 @@ import * as path from "path";
 import { fileURLToPath } from "url";
 import type { HookEvent, NormalizedEvent } from "./types.ts";
 import { adaptHookEvent, isStuckEvent, isUnstuckEvent, isSessionRegistered, isSessionEnded } from "./claude-adapter.ts";
+import { validateNormalizedEvent } from "./normalized-event.ts";
 import { upsertSession, deleteSession, enqueue, dequeue, dequeueByPaneId, skipHead, getHead, getStuckCount, getAllStuck, cleanupQueue, getSession, getStarvationDiagnostic } from "./db.ts";
 import { startReconcileLoop, reconcileStuckDirection, startStarvationDetection } from "./reconcile.ts";
 import { startNotificationChecker } from "./notify.ts";
@@ -255,62 +256,23 @@ const server = http.createServer(async (req, res) => {
         req.on("end", () => resolve(data));
       });
 
-      let event: NormalizedEvent;
+      let raw: unknown;
       try {
-        event = JSON.parse(body) as NormalizedEvent;
+        raw = JSON.parse(body) as unknown;
       } catch {
         res.writeHead(400, { "Content-Type": "application/json" });
         res.end(JSON.stringify({ error: "Invalid JSON" }));
         return;
       }
 
-      // Validate type discriminator
-      if (!event.type || !["stuck", "unstuck", "registered", "ended"].includes(event.type)) {
+      const validation = validateNormalizedEvent(raw);
+      if (!validation.ok) {
         res.writeHead(400, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ error: "Missing or invalid event type" }));
+        res.end(JSON.stringify({ error: validation.error }));
         return;
       }
 
-      // Route by event type
-      if (event.type === "stuck") {
-        // Clean up any bootstrap synthetic entry for this pane before registering real session
-        if (event.sessionId !== event.paneId) {
-          dequeueByPaneId(event.paneId, event.sessionId);
-        }
-        upsertSession(
-          event.sessionId,
-          event.paneId,
-          event.cwd,
-          event.transcriptPath,
-          event.timestamp,
-          event.reason,
-          event.message
-        );
-        enqueue(event.sessionId, event.reason, event.timestamp);
-        console.log(`[normalized] stuck: ${event.sessionId.slice(0, 8)} (${event.reason})`);
-      } else if (event.type === "unstuck") {
-        const sess = getSession(event.sessionId);
-        dequeue(event.sessionId);
-        console.log(`[normalized] unstuck: ${event.sessionId.slice(0, 8)}`);
-        // Auto-jump if enabled and this was the operator's current pane
-        if (sess) {
-          maybeAutoJump(sess.pane_id);
-        }
-      } else if (event.type === "registered") {
-        upsertSession(
-          event.sessionId,
-          event.paneId,
-          event.cwd,
-          event.transcriptPath,
-          null,
-          null,
-          null
-        );
-        console.log(`[normalized] registered: ${event.sessionId.slice(0, 8)} -> ${event.paneId}`);
-      } else if (event.type === "ended") {
-        deleteSession(event.sessionId);
-        console.log(`[normalized] ended: ${event.sessionId.slice(0, 8)}`);
-      }
+      dispatchNormalizedEvent(validation.event);
 
       res.writeHead(200, { "Content-Type": "application/json" });
       res.end(JSON.stringify({ ok: true }));
@@ -412,6 +374,55 @@ const server = http.createServer(async (req, res) => {
     res.end(JSON.stringify({ error: "Internal server error" }));
   }
 });
+
+function dispatchNormalizedEvent(event: NormalizedEvent): void {
+  if (event.type === "stuck") {
+    // Clean up any bootstrap synthetic entry for this pane before registering real session.
+    if (event.sessionId !== event.paneId) {
+      dequeueByPaneId(event.paneId, event.sessionId);
+    }
+    upsertSession(
+      event.sessionId,
+      event.paneId,
+      event.cwd,
+      event.transcriptPath,
+      event.timestamp,
+      event.reason,
+      event.message
+    );
+    enqueue(event.sessionId, event.reason, event.timestamp);
+    console.log(`[normalized] stuck: ${event.sessionId.slice(0, 8)} (${event.reason})`);
+    return;
+  }
+
+  if (event.type === "unstuck") {
+    const sess = getSession(event.sessionId);
+    dequeue(event.sessionId);
+    console.log(`[normalized] unstuck: ${event.sessionId.slice(0, 8)}`);
+    // Auto-jump if enabled and this was the operator's current pane.
+    if (sess) {
+      maybeAutoJump(sess.pane_id);
+    }
+    return;
+  }
+
+  if (event.type === "registered") {
+    upsertSession(
+      event.sessionId,
+      event.paneId,
+      event.cwd,
+      event.transcriptPath,
+      null,
+      null,
+      null
+    );
+    console.log(`[normalized] registered: ${event.sessionId.slice(0, 8)} -> ${event.paneId}`);
+    return;
+  }
+
+  deleteSession(event.sessionId);
+  console.log(`[normalized] ended: ${event.sessionId.slice(0, 8)}`);
+}
 
 async function getStoredSession(sessionId: string): Promise<{ session_id: string; pane_id: string } | null> {
   // Direct query since db.ts functions return full rows
