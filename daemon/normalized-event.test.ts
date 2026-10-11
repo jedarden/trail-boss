@@ -1,4 +1,5 @@
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
+import { Database } from "bun:sqlite";
 import { mkdtemp, rm } from "node:fs/promises";
 import { join } from "node:path";
 import { spawn, type ChildProcess } from "node:child_process";
@@ -143,5 +144,9 @@ describe("POST /event/normalized", () => {
       await expect(postEvent(event)).resolves.toEqual({ status: 200, json: { ok: true } });
     }
     expect((await (await fetch(`${baseUrl}/queue`)).json()).count).toBe(0);
+
+    const db = new Database(join(dataDir, "trailboss.db"));
+    expect(db.query("SELECT session_id FROM sessions WHERE session_id = ?").get(sessionId)).toBeNull();
+    db.close();
   });
 });

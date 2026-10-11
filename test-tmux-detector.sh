@@ -17,15 +17,18 @@
 set -e
 
 TB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-DAEMON_URL="http://127.0.0.1:4000"
+DAEMON_PORT="${TRAILBOSS_TEST_PORT:-4000}"
+DAEMON_URL="http://127.0.0.1:$DAEMON_PORT"
 
 # Add bun to PATH
 export PATH="$HOME/.bun/bin:$PATH"
-DATA_DIR="$HOME/.local/share/trailboss"
+DATA_DIR="${TRAILBOSS_TEST_DATA_DIR:-/tmp/trailboss-detector-data-$$}"
 
 # Isolated tmux socket — never touches the user's main server
 TMUX_TEST_SOCK="/tmp/tmux-trailboss-detector-$$"
 TMUX="tmux -S $TMUX_TEST_SOCK"
+DAEMON_PID=""
+DETECTOR_PID=""
 
 # Fast thresholds for testing (override defaults)
 export TRAILBOSS_POLL_INTERVAL_MS=500   # Check every 0.5s
@@ -37,11 +40,9 @@ export TRAILBOSS_OPT_IN_PREFIX="@tb-test-"
 cleanup() {
   echo "[cleanup] tearing down test environment..."
 
-  # Stop detector
-  pkill -f "tmux-detector.ts" 2>/dev/null || true
-
-  # Stop daemon
-  pkill -f "bun index.ts" 2>/dev/null || true
+  # Stop only processes started by this test.
+  if [ -n "$DETECTOR_PID" ]; then kill "$DETECTOR_PID" 2>/dev/null || true; fi
+  if [ -n "$DAEMON_PID" ]; then kill "$DAEMON_PID" 2>/dev/null || true; fi
 
   # Kill test tmux server
   $TMUX kill-server 2>/dev/null || true
@@ -66,7 +67,7 @@ sleep 1
 echo "[setup] Starting daemon..."
 mkdir -p "$DATA_DIR"
 cd "$TB_DIR/daemon"
-bun index.ts > /tmp/tb-daemon-log-$$ 2>&1 &
+TRAILBOSS_PORT="$DAEMON_PORT" TRAILBOSS_DATA_DIR="$DATA_DIR" bun index.ts > /tmp/tb-daemon-log-$$ 2>&1 &
 DAEMON_PID=$!
 sleep 2
 
@@ -131,7 +132,7 @@ TRAILBOSS_POLL_INTERVAL_MS=500 \
 TRAILBOSS_QUIET_THRESHOLD_MS=3000 \
 TRAILBOSS_DAEMON_URL="$DAEMON_URL/event/normalized" \
 TRAILBOSS_OPT_IN_PREFIX="@tb-test-" \
-TMUX="$TMUX" \
+TRAILBOSS_TMUX_SOCKET="$TMUX_TEST_SOCK" \
 bun tmux-detector.ts > /tmp/tb-detector-log-$$ 2>&1 &
 DETECTOR_PID=$!
 echo "[step 2] detector running (PID $DETECTOR_PID)"
@@ -224,7 +225,7 @@ echo ""
 echo "[step 6] Waiting for unstuck detection..."
 
 # Wait for detector to notice output change and emit unstuck
-sleep 3
+sleep 5
 
 # Check detector logged unstuck event
 if ! grep -q "unstuck:" /tmp/tb-detector-log-$$; then
@@ -247,6 +248,32 @@ fi
 echo "[step 6] session $SESSION_ID removed from queue ✓"
 
 # ============================================================================
+# Step 7: End the pane and verify the detector's ended event removes state
+# ============================================================================
+echo ""
+echo "[step 7] Ending the tmux pane and verifying session cleanup..."
+$TMUX kill-session -t "test-session"
+sleep 2
+
+if ! grep -q "untracked pane" /tmp/tb-detector-log-$$; then
+  echo "[error] detector failed to emit ended event for the closed pane"
+  cat /tmp/tb-detector-log-$$
+  exit 1
+fi
+
+if ! DATA_DIR="$DATA_DIR" SESSION_ID="$SESSION_ID" bun -e '
+  import { Database } from "bun:sqlite";
+  const db = new Database(`${process.env.DATA_DIR}/trailboss.db`);
+  const row = db.query("SELECT session_id FROM sessions WHERE session_id = ?").get(process.env.SESSION_ID);
+  db.close();
+  if (row !== null) process.exit(1);
+'; then
+  echo "[error] ended event left the session registry row behind"
+  exit 1
+fi
+echo "[step 7] ended event removed session state ✓"
+
+# ============================================================================
 # Summary
 # ============================================================================
 echo ""
@@ -256,6 +283,7 @@ echo "✓ Pane transitioned to stuck after quiet threshold"
 echo "✓ Pane appeared in Trail Boss queue with reason='stopped'"
 echo "✓ Pane transitioned to unstuck after activity"
 echo "✓ Pane removed from queue after unstuck event"
+echo "✓ Pane ended and session state was removed"
 echo ""
 echo "Full detector log available at: /tmp/tb-detector-log-$$"
 echo "Full daemon log available at: /tmp/tb-daemon-log-$$"

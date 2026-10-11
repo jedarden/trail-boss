@@ -20,6 +20,7 @@ const POLL_INTERVAL_MS = parseInt(process.env.TRAILBOSS_POLL_INTERVAL_MS || "") 
 const QUIET_THRESHOLD_MS = parseInt(process.env.TRAILBOSS_QUIET_THRESHOLD_MS || "") || 30000;
 const OPT_IN_PREFIX = process.env.TRAILBOSS_OPT_IN_PREFIX || "@tb-";
 const DAEMON_URL = process.env.TRAILBOSS_DAEMON_URL || "http://127.0.0.1:4000/event/normalized";
+const TMUX_SOCKET = process.env.TRAILBOSS_TMUX_SOCKET || "";
 
 // ============================================================================
 // Types
@@ -67,6 +68,10 @@ const PROMPT_PATTERNS = [
 
 const trackedPanes = new Map<string, PaneState>();
 let isRunning = true;
+// Keep lifecycle events in detector order. The poll loop intentionally does
+// not block on HTTP, but a slow stuck request must not be overtaken by the
+// following unstuck request or the queue can be re-filled after it is drained.
+let pendingEmission = Promise.resolve();
 
 // ============================================================================
 // Logging
@@ -85,11 +90,10 @@ function log(message: string): void {
  * Get the tmux command with custom socket if specified
  */
 function getTmuxCmd(): string {
-  const tmuxSocket = process.env.TMUX;
-  if (tmuxSocket && tmuxSocket.startsWith("tmux -S")) {
-    return tmuxSocket; // Already includes the socket flag
+  if (TMUX_SOCKET) {
+    return `tmux -S ${TMUX_SOCKET}`;
   }
-  return tmuxSocket ? `tmux -S ${tmuxSocket}` : "tmux";
+  return "tmux";
 }
 
 /**
@@ -162,7 +166,8 @@ function paneExists(paneId: string): boolean {
  */
 function getPaneCwd(paneId: string): string {
   try {
-    const cmd = `tmux display -p -t ${paneId} '#{pane_current_path}'`;
+    const tmuxCmd = getTmuxCmd();
+    const cmd = `${tmuxCmd} display -p -t ${paneId} '#{pane_current_path}'`;
     return execSync(cmd, { stdio: ["ignore", "pipe", "ignore"] })
       .toString()
       .trim();
@@ -217,7 +222,7 @@ function getLastLine(output: string): string {
 /**
  * Emit a normalized event to the daemon
  */
-async function emitEvent(event: NormalizedEvent): Promise<boolean> {
+async function sendEvent(event: NormalizedEvent): Promise<boolean> {
   try {
     const response = await fetch(DAEMON_URL, {
       method: "POST",
@@ -236,6 +241,12 @@ async function emitEvent(event: NormalizedEvent): Promise<boolean> {
     log(`[emit] Network error: ${err}`);
     return false;
   }
+}
+
+function emitEvent(event: NormalizedEvent): Promise<boolean> {
+  const result = pendingEmission.then(() => sendEvent(event));
+  pendingEmission = result.then(() => undefined, () => undefined);
+  return result;
 }
 
 // ============================================================================

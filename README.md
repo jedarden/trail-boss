@@ -116,7 +116,7 @@ bun run daemon/tmux-detector.ts
 | Quiet threshold | `TRAILBOSS_QUIET_THRESHOLD_MS` | 30000ms (30s) |
 | Opt-in prefix | `TRAILBOSS_OPT_IN_PREFIX` | `@tb-` |
 | Daemon URL | `TRAILBOSS_DAEMON_URL` | `http://127.0.0.1:4000/event/normalized` |
-| Tmux socket | `TMUX` | `tmux` |
+| Tmux socket | `TRAILBOSS_TMUX_SOCKET` | `tmux` (all servers) |
 
 **Operational considerations:**
 

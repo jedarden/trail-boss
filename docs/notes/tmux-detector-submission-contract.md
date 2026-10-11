@@ -150,7 +150,7 @@ On `SIGINT` or `SIGTERM`, the detector:
 | `TRAILBOSS_POLL_INTERVAL_MS` | `2000` | Poll cycle interval in milliseconds |
 | `TRAILBOSS_QUIET_THRESHOLD_MS` | `30000` | Minimum quiet time before declaring stuck |
 | `TRAILBOSS_OPT_IN_PREFIX` | `@tb-` | Pane title prefix for opt-in monitoring |
-| `TMUX` | (none) | Custom tmux socket path (for test isolation) |
+| `TRAILBOSS_TMUX_SOCKET` | (none) | Custom tmux socket path (for test isolation) |
 
 ## Error Handling
 
