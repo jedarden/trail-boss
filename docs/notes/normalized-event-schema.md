@@ -290,21 +290,16 @@ interface SessionEnded {
 
 ### Invalid Events
 
-The daemon `/event/normalized` endpoint returns `400 Bad Request` for:
+The daemon `/event/normalized` endpoint returns `400 Bad Request` with one of these deterministic error bodies:
 
-1. Missing required fields
-2. Invalid type literals (e.g., `type: "stuckk"`)
-3. Invalid enum values (e.g., `reason: "blocked"`)
-4. Invalid timestamps (e.g., `timestamp: -1` or `timestamp: "2024-01-01"`)
-5. Malformed JSON
+| Error body | Meaning |
+|------------|---------|
+| `{"error": "Invalid JSON"}` | The request body is malformed JSON. |
+| `{"error": "Invalid or missing event type"}` | The parsed JSON value is not an object, or its `type` field is missing, empty, or not a string. |
+| `{"error": "Unknown event type"}` | `type` is a string other than `stuck`, `unstuck`, `registered`, or `ended`. |
+| `{"error": "Invalid event fields"}` | A supported type is missing a required field or a field has an invalid value. |
 
-Error response format:
-
-```json
-{
-  "error": "Invalid event: missing required field 'sessionId'"
-}
-```
+Validation completes before dispatch, so rejected input does not mutate session or queue state. Field requirements and accepted values are defined in the [normalized event contract](normalized-event-contract.md#field-validation).
 
 ### Out-of-Order Events
 
@@ -320,7 +315,7 @@ Events with unknown `type` values are rejected with `400 Bad Request`:
 
 ```json
 {
-  "error": "Invalid event: unknown type 'paused'"
+  "error": "Unknown event type"
 }
 ```
 

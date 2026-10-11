@@ -31,8 +31,21 @@ Content-Type: application/json
 | Status | Body | Description |
 |--------|------|-------------|
 | 400 | `{"error": "Invalid JSON"}` | Request body is not valid JSON |
-| 400 | `{"error": "Invalid or missing event type"}` | Missing or invalid `type` field |
+| 400 | `{"error": "Invalid or missing event type"}` | The JSON value is not an object, or `type` is missing, empty, or not a string |
+| 400 | `{"error": "Unknown event type"}` | `type` is a string other than `stuck`, `unstuck`, `registered`, or `ended` |
+| 400 | `{"error": "Invalid event fields"}` | A supported event type is missing a required field or a field has an invalid value |
 | 500 | `{"error": "Internal server error"}` | Server-side processing error |
+
+The endpoint returns these same status and error body for the same invalid request. It validates the entire payload before dispatching it; a rejected request does not change session or queue state.
+
+### Field validation
+
+- `sessionId` and `paneId` must be strings containing at least one non-whitespace character.
+- `cwd` and `transcriptPath` must be strings. Empty strings are allowed for synthetic sessions.
+- `reason` must be exactly `stopped` or `permission`.
+- `message` must be a string containing at least one non-whitespace character.
+- `timestamp` must be a finite JSON number greater than zero.
+- Event-specific required fields are listed in each event's table below. Fields not used by an event are not required.
 
 ## Event Types
 
