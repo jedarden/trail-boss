@@ -12,6 +12,7 @@ DATA_DIR="$(mktemp -d /tmp/tb-starvation-data.XXXXXX)"
 TEST_BASE="tb-starvation-$$"
 REGRESSION_DIR=""
 RECOVERY_DIR=""
+ALERT_DIR=""
 DAEMON_PID=""
 
 # Add bun to PATH
@@ -30,6 +31,9 @@ cleanup() {
   fi
   if [ -n "$RECOVERY_DIR" ]; then
     rm -rf "$RECOVERY_DIR" 2>/dev/null || true
+  fi
+  if [ -n "$ALERT_DIR" ]; then
+    rm -rf "$ALERT_DIR" 2>/dev/null || true
   fi
 }
 trap cleanup EXIT
@@ -470,6 +474,7 @@ const fs = await import("fs");
 process.chdir(scenarioDir); // workspaceRoot and the diagnostics dir resolve from CWD
 const {
   detectBeadStarvation,
+  reconcileStarvationAlerts,
   loadLastHeartbeatByWorker,
   loadLastClaimerByBead,
   loadLastEventByWorker,
@@ -509,6 +514,11 @@ const diag = await detectBeadStarvation();
 assert(diag !== null, "diagnostic produced for excluded beads");
 assert(diag!.recovered === true, "starvation recovered once the dead worker's bead returned to the frontier");
 
+// Recovery is the detector's verdict; the lifecycle turns it into the alert
+// decision. No alert is open in this fixture and the condition resolved, so
+// nothing is filed and nothing is closed.
+await reconcileStarvationAlerts(diag);
+
 const attempts = diag!.recovery_attempts.join("\n");
 assert(attempts.includes("ready 0 -> 1"), "recovery records the ready count rising: " +
   (attempts.match(/ready \d+ -> \d+/)?.[0] ?? "no rise recorded"));
@@ -527,6 +537,7 @@ assert(attempts.includes("signal live") && attempts.includes("tb-tst-live"),
   (attempts.match(/bead tb-tst-live: .*$/m)?.[0] ?? "nothing recorded"));
 assert(attempts.includes("tb-tst-evlive"), "event-live worker decision recorded");
 assert(!stubLog.includes("CREATE "), "no alert bead filed when recovery succeeded");
+assert(!stubLog.includes("CLOSE "), "no alert closed when none was open");
 
 if (failures > 0) process.exit(1);
 TS
@@ -576,10 +587,14 @@ function assert(cond: boolean, msg: string): void {
 
 const fs = await import("fs");
 process.chdir(scenarioDir);
-const { detectBeadStarvation } = await import(daemonDir);
+const { detectBeadStarvation, reconcileStarvationAlerts } = await import(daemonDir);
 
 const diag = await detectBeadStarvation();
 assert(diag !== null && diag!.recovered === false, "nothing recovered when the only worker is live");
+
+// Nothing qualifies for remediation, so the starvation persists: the
+// lifecycle files the first alert (none is open)
+await reconcileStarvationAlerts(diag);
 
 const stubLog = fs.readFileSync(process.env.TB_STUB_LOG!, "utf-8");
 assert(!stubLog.includes("CLEAR "), "no assignee cleared while the worker is live");
@@ -607,6 +622,330 @@ echo "  [scenario-b] single live-worker bead, nothing qualifies"
 echo "[PASS] scenario B: nothing cleared, alert path carries the triage"
 echo ""
 
+# Test 9: self-healing starvation alert lifecycle (trailbos-60a684b9).
+# The loop that detects starvation also resolves its own alerts: a resolved
+# diagnostic closes the open alert with the evidence in the close reason, a
+# persistent starvation refreshes the one open alert in place instead of
+# filing a duplicate, and the trailbos-8cae488d zero-field diagnostic is both
+# rejected at emission and auto-closed as a false positive when one is
+# already open. Invariant: at most one open starvation-alert bead.
+echo "[test-9] Testing alert lifecycle: close resolved / refresh persistent / zero-field auto-close..."
+
+ALERT_DIR="$(mktemp -d /tmp/tb-starvation-alert.XXXXXX)"
+SC_9A="$ALERT_DIR/resolved"
+SC_9A2="$ALERT_DIR/benign"
+SC_9B="$ALERT_DIR/refresh"
+SC_9C="$ALERT_DIR/zero-field"
+OLD_TS="$(date -u -d '3 hours ago' +%Y-%m-%dT%H:%M:%S)+00:00"
+MID_TS="$(date -u -d '40 minutes ago' +%Y-%m-%dT%H:%M:%S)+00:00"
+RECENT_TS="$(date -u -d '1 hour ago' +%Y-%m-%dT%H:%M:%S)+00:00"
+
+mkdir -p "$SC_9A/.beads" "$SC_9A2/.beads" "$SC_9B/.beads" "$SC_9C/.beads"
+
+# ---------------------------------------------------------------------------
+# Fixture bead CLI with mutable open-bead state: `create`d alert beads show up
+# on the next open listing, `close`d beads drop off it, and `update` enforces
+# the --if-revision guard a real store enforces (mismatch -> exit 4).
+# ---------------------------------------------------------------------------
+write_alert_stub() {
+  local dir="$1" log="$2"
+  cat > "$dir/bead-stub" <<STUB
+#!/usr/bin/env bash
+LOG="$log"
+DIR="$dir"
+
+open_records() {
+  { [ -f "\$DIR/fixtures-open.jsonl" ] && cat "\$DIR/fixtures-open.jsonl"
+    [ -f "\$DIR/runtime-alerts.jsonl" ] && cat "\$DIR/runtime-alerts.jsonl"; } 2>/dev/null \\
+    | if [ -s "\$DIR/closed-ids" ]; then grep -v -F -f "\$DIR/closed-ids"; else cat; fi \\
+    | jq -c -s 'group_by(.id) | map(last)[]'
+}
+
+record_for() {
+  { [ -f "\$DIR/fixtures-open.jsonl" ] && cat "\$DIR/fixtures-open.jsonl"
+    [ -f "\$DIR/runtime-alerts.jsonl" ] && cat "\$DIR/runtime-alerts.jsonl"; } 2>/dev/null \\
+    | jq -c --arg id "\$1" 'select(.id == \$id)' | tail -1
+}
+
+case "\$1" in
+  update)
+    id="\$2"
+    rec=\$(record_for "\$id")
+    if [ -z "\$rec" ]; then
+      printf 'UPDATE-UNKNOWN %s\n' "\$id" >> "\$LOG"
+      exit 1
+    fi
+    cur=\$(printf '%s' "\$rec" | jq -r '.revision // 1')
+    ifrev=""
+    notes=""
+    prev=""
+    for a in "\$@"; do
+      if [ "\$prev" = "--notes" ]; then notes="\$a"; fi
+      if [ "\$prev" = "--if-revision" ]; then ifrev="\$a"; fi
+      prev="\$a"
+    done
+    if [ -n "\$ifrev" ] && [ "\$ifrev" != "\$cur" ]; then
+      printf 'REVISION-CONFLICT %s (store %s, sent %s)\n' "\$id" "\$cur" "\$ifrev" >> "\$LOG"
+      exit 4
+    fi
+    if [ -n "\$ifrev" ]; then printf 'IFREV %s %s\n' "\$id" "\$ifrev" >> "\$LOG"; fi
+    printf 'UPDATE %s\n' "\$id" >> "\$LOG"
+    printf 'NOTES<<<%s>>>\n' "\$notes" >> "\$LOG"
+    printf '%s' "\$rec" | jq -c --argjson r "\$((cur + 1))" --arg n "\$notes" '.revision = \$r | .notes = \$n' >> "\$DIR/runtime-alerts.jsonl"
+    exit 0 ;;
+  close)
+    id="\$2"
+    shift 2
+    if [ "\$1" = "--reason" ]; then shift; fi
+    printf 'CLOSE %s\n' "\$id" >> "\$LOG"
+    printf 'REASON<<<%s>>>\n' "\$*" >> "\$LOG"
+    printf '"id":"%s"\n' "\$id" >> "\$DIR/closed-ids"
+    exit 0 ;;
+  create)
+    printf 'CREATE %s\n' "\$*" >> "\$LOG"
+    # Only an actual starvation alert becomes an open alert bead; a
+    # detector-bug create is logged but does not join the open frontier.
+    case "\$*" in
+      *alert:starvation:unknown*)
+        printf '{"id":"tb-al-created-%s","title":"Starvation alert (stub-created)","status":"open","assignee":null,"manual_blocked":false,"labels":["alert:starvation:unknown","human","starvation-alert"],"dependencies":[],"notes":"","revision":1,"created_at":"%s"}\n' \\
+          "\$(date +%s%N)" "\$(date -u +%Y-%m-%dT%H:%M:%S)+00:00" >> "\$DIR/runtime-alerts.jsonl" ;;
+    esac
+    exit 0 ;;
+  list)
+    printf 'bead %s\n' "\$*" >> "\$LOG"
+    case "\$*" in
+      *" --ready"*)
+        { [ -f "\$DIR/fixtures-ready.jsonl" ] && cat "\$DIR/fixtures-ready.jsonl"; } 2>/dev/null \\
+          | if [ -s "\$DIR/closed-ids" ]; then grep -v -F -f "\$DIR/closed-ids"; else cat; fi ;;
+      *" --status open"*) open_records ;;
+      *"list --json"*) [ -f "\$DIR/fixtures-all.jsonl" ] && cat "\$DIR/fixtures-all.jsonl" ;;
+    esac
+    exit 0 ;;
+  *)
+    printf 'bead %s\n' "\$*" >> "\$LOG"
+    exit 0 ;;
+esac
+exit 0
+STUB
+  chmod +x "$dir/bead-stub"
+}
+
+# Alert bead record template: labels are what the real emitter stamps.
+alert_record() {  # id revision created_at notes
+  printf '{"id":"%s","title":"Starvation alert: beads invisible in /ws","status":"open","assignee":null,"manual_blocked":false,"labels":["alert:starvation:unknown","human","starvation-alert"],"dependencies":[],"notes":"%s","revision":%s,"created_at":"%s"}\n' "$1" "$4" "$2" "$3"
+}
+plain_record() {  # id title
+  printf '{"id":"%s","title":"%s","status":"open","assignee":null,"manual_blocked":false,"labels":[],"dependencies":[],"notes":"","revision":2,"created_at":"%s"}\n' "$1" "$2" "$RECENT_TS"
+}
+
+# --- scenario 9a: the condition resolved -> the stale alert is closed -------
+alert_record tb-al-resolved 4 "$OLD_TS" "operator context - keep" > "$SC_9A/fixtures-open.jsonl"
+plain_record tb-normal "plain open bead" >> "$SC_9A/fixtures-open.jsonl"
+alert_record tb-al-resolved 4 "$OLD_TS" "operator context - keep" > "$SC_9A/fixtures-ready.jsonl"
+plain_record tb-normal "plain open bead" >> "$SC_9A/fixtures-ready.jsonl"
+cat "$SC_9A/fixtures-open.jsonl" > "$SC_9A/fixtures-all.jsonl"
+
+# --- scenario 9a2: every excluded bead is held by design (tb-bctb shape) ----
+alert_record tb-al-benign 2 "$OLD_TS" "" > "$SC_9A2/fixtures-open.jsonl"
+plain_record tb-keeper "claimable work" >> "$SC_9A2/fixtures-open.jsonl"
+plain_record tb-keeper "claimable work" > "$SC_9A2/fixtures-ready.jsonl"
+cat "$SC_9A2/fixtures-open.jsonl" > "$SC_9A2/fixtures-all.jsonl"
+
+# --- scenario 9b: starvation persists -> refresh, never duplicate ------------
+alert_record tb-al-primary 7 "$OLD_TS" "operator context - keep" > "$SC_9B/fixtures-open.jsonl"
+alert_record tb-al-extra 1 "$MID_TS" "" >> "$SC_9B/fixtures-open.jsonl"
+plain_record tb-stuck "unexplained stuck bead" >> "$SC_9B/fixtures-open.jsonl"
+: > "$SC_9B/fixtures-ready.jsonl"
+cat "$SC_9B/fixtures-open.jsonl" > "$SC_9B/fixtures-all.jsonl"
+
+# --- scenario 9c: zero-field diagnostic, one alert already open --------------
+alert_record tb-al-zero 2 "$RECENT_TS" "" > "$SC_9C/fixtures-open.jsonl"
+alert_record tb-al-zero 2 "$RECENT_TS" "" > "$SC_9C/fixtures-ready.jsonl"
+cat "$SC_9C/fixtures-open.jsonl" > "$SC_9C/fixtures-all.jsonl"
+
+cat > "$ALERT_DIR/alert-lifecycle.ts" <<'TS'
+const daemonDir = process.env.TB_DAEMON_DIR + "/reconcile.ts";
+const scenarioDir = process.env.TB_SCENARIO_DIR!;
+let failures = 0;
+function assert(cond: boolean, msg: string): void {
+  if (cond) {
+    console.log("  [ok] " + msg);
+  } else {
+    console.error("  [FAIL] " + msg);
+    failures++;
+  }
+}
+
+const fs = await import("fs");
+process.chdir(scenarioDir); // workspaceRoot and the diagnostics dir resolve from CWD
+const {
+  detectBeadStarvation,
+  reconcileStarvationAlerts,
+  decideStarvationAlertAction,
+  createStarvationAlertBead,
+  validateStarvationAlert,
+} = await import(daemonDir);
+
+const readLog = () => fs.readFileSync(process.env.TB_STUB_LOG!, "utf-8");
+function closeReasons(log: string): Map<string, string> {
+  return new Map([...log.matchAll(/CLOSE (\S+)\nREASON<<<([\s\S]*?)>>>/g)].map(m => [m[1], m[2]]));
+}
+
+switch (process.env.TB_SCENARIO) {
+  // (a) resolved diagnostic closes the open alert, evidence in the close reason
+  case "resolved": {
+    const diag = await detectBeadStarvation();
+    assert(diag === null, "nothing excluded from the ready frontier -> no starvation");
+    await reconcileStarvationAlerts(diag);
+
+    const log = readLog();
+    const reasons = closeReasons(log);
+    assert(reasons.has("tb-al-resolved"), "stale alert bead closed");
+    const reason = reasons.get("tb-al-resolved") ?? "";
+    assert(reason.includes("(resolved)"), "closed as resolved: " + reason.slice(0, 80));
+    assert(reason.includes("2 open beads, 2 ready, 0 excluded"), "close reason quotes the live counts");
+    assert(reason.includes("nothing held outside the ready frontier"), "close reason quotes the frontier result");
+    assert(!log.includes("CREATE "), "no new alert filed");
+    assert(!log.includes("UPDATE "), "nothing rewritten on the way out");
+
+    // unit: a recovered diagnostic closes with the recovery in the evidence
+    const recovered = {
+      timestamp: new Date().toISOString(),
+      workspace: scenarioDir,
+      open_beads: 3, ready_beads: 3, excluded_beads: 0,
+      exclusion_reasons: [],
+      recovered: true,
+      recovery_attempts: ["bead sync flush completed", "starvation resolved after sync flush"],
+    };
+    const action = await decideStarvationAlertAction(recovered as never, scenarioDir);
+    assert(action.action === "close" && action.kind === "resolved", "recovered diagnostic closes as resolved");
+    assert(action.action === "close" && action.evidence.includes("starvation resolved after sync flush"),
+      "close evidence carries the recovery attempts");
+    break;
+  }
+
+  // (a2) the tb-bctb shape: frontier non-empty, every excluded bead held by
+  // design (the alert bead itself is human-labeled) -> closed as benign
+  case "benign": {
+    const diag = await detectBeadStarvation();
+    assert(diag !== null && diag!.recovered === false, "diagnostic produced, not recoverable by flush or clearing");
+    assert(diag!.excluded_classifications?.[0]?.deliberate === true,
+      "the only excluded bead classifies as held by design: " + JSON.stringify(diag!.excluded_classifications));
+
+    await reconcileStarvationAlerts(diag);
+    const reasons = closeReasons(readLog());
+    assert(reasons.has("tb-al-benign"), "benign-shape alert closed");
+    const reason = reasons.get("tb-al-benign") ?? "";
+    assert(reason.includes("(benign)"), "closed as benign: " + reason.slice(0, 80));
+    assert(reason.includes("label filter ('human')"), "close reason names the classification cause");
+    assert(reason.includes("1 of 2 open beads visible"), "close reason quotes the non-empty frontier");
+    assert(!readLog().includes("CREATE "), "no new alert filed");
+    break;
+  }
+
+  // (b) persistent starvation refreshes the existing bead, never duplicates
+  case "refresh": {
+    const diag1 = await detectBeadStarvation();
+    assert(diag1 !== null && diag1!.recovered === false, "starvation detected, not recoverable");
+    await reconcileStarvationAlerts(diag1);
+
+    let log = readLog();
+    assert(!log.includes("CREATE "), "no duplicate alert filed while one is open");
+    const reasons = closeReasons(log);
+    assert(reasons.has("tb-al-extra"), "extra open alert closed");
+    const dupReason = reasons.get("tb-al-extra") ?? "";
+    assert(dupReason.includes("(duplicate)") && dupReason.includes("tb-al-primary"),
+      "duplicate closed pointing at the canonical alert: " + dupReason.slice(0, 80));
+    assert(dupReason.includes("at most one open starvation alert"), "duplicate close states the invariant");
+
+    assert(/IFREV tb-al-primary \d+/.test(log), "refresh of the canonical alert is revision-guarded");
+    assert(!log.includes("REVISION-CONFLICT tb-al-primary"), "the guard sent the store's current revision");
+    const notesBlocks = [...log.matchAll(/NOTES<<<([\s\S]*?)>>>/g)].map(m => m[1]);
+    const refreshBlock = notesBlocks.find(n => n.includes("starvation alert refresh @"));
+    assert(refreshBlock !== undefined, "refresh block written to the alert notes");
+    assert((refreshBlock ?? "").startsWith("operator context - keep"),
+      "read-modify-write preserves the operator's existing notes");
+    assert((refreshBlock ?? "").includes("still starved: open=3 ready=0 excluded=3"),
+      "refresh carries the fresh counts");
+    assert((refreshBlock ?? "").includes("bead tb-stuck: no mechanical cause identified"),
+      "refresh carries the exclusion reasons");
+
+    // Immediate second cycle: the fresh refresh throttles, the single alert
+    // stays single, and nothing new is filed.
+    const updatesAfterCycle1 = [...log.matchAll(/^UPDATE tb-al-primary$/gm)].length;
+    const diag2 = await detectBeadStarvation();
+    await reconcileStarvationAlerts(diag2);
+    log = readLog();
+    const updatesAfterCycle2 = [...log.matchAll(/^UPDATE tb-al-primary$/gm)].length;
+    assert(updatesAfterCycle2 === updatesAfterCycle1,
+      `refresh throttled within the window (cycle 1: ${updatesAfterCycle1}, cycle 2: ${updatesAfterCycle2})`);
+    assert(!log.includes("CREATE "), "still no duplicate after the second cycle");
+    break;
+  }
+
+  // (c) the exact trailbos-8cae488d zero-field diagnostic: rejected at
+  // emission, and auto-closed as a false positive when one is already open
+  case "zero-field": {
+    const zeroField = {
+      timestamp: "2026-08-29T11:43:41.045665473+00:00",
+      workspace: "",
+      open_beads: 0,
+      ready_beads: 0,
+      excluded_beads: 0,
+      exclusion_reasons: [],
+      recovered: false,
+      recovery_attempts: [],
+    };
+    assert(validateStarvationAlert(zeroField).actionable === false, "guard rejects the zero-field diagnostic at emission");
+    createStarvationAlertBead(zeroField);
+
+    let log = readLog();
+    assert(!log.includes("Starvation alert: beads invisible"), "no starvation alert emitted for the zero-field diagnostic");
+    assert(log.includes("starvation-detector-bug"), "detector-bug bead filed instead");
+
+    await reconcileStarvationAlerts(zeroField as never);
+    const reasons = closeReasons(readLog());
+    assert(reasons.has("tb-al-zero"), "already-open alert auto-closed");
+    const reason = reasons.get("tb-al-zero") ?? "";
+    assert(reason.includes("(invalid)"), "closed as invalid: " + reason.slice(0, 80));
+    assert(reason.includes("workspace is blank"), "close reason quotes the validation failure");
+    assert(reason.includes("open=0 ready=0 excluded=0"), "close reason quotes the zero counts");
+    break;
+  }
+
+  default:
+    console.error("  [FAIL] unknown scenario " + process.env.TB_SCENARIO);
+    failures++;
+}
+
+if (failures > 0) process.exit(1);
+TS
+
+run_alert_scenario() {  # dir scenario-name pass-message
+  local dir="$1" scenario="$2" message="$3"
+  write_alert_stub "$dir" "$ALERT_DIR/stub-$scenario.log"
+  echo "  [scenario-$scenario] $message"
+  (
+    cd "$dir"
+    TRAILBOSS_BEAD_BIN="$dir/bead-stub" \
+    TB_DAEMON_DIR="$TB_DIR/daemon" \
+    TB_SCENARIO_DIR="$dir" \
+    TB_SCENARIO="$scenario" \
+    TB_STUB_LOG="$ALERT_DIR/stub-$scenario.log" \
+      bun "$ALERT_DIR/alert-lifecycle.ts"
+  )
+}
+
+run_alert_scenario "$SC_9A" resolved "resolved diagnostic closes the stale alert with evidence"
+echo "[PASS] 9a: resolved diagnostic closed the open alert, evidence in the close reason"
+run_alert_scenario "$SC_9A2" benign "every excluded bead held by design closes the alert as benign"
+echo "[PASS] 9a2: label-filtered shape closed as benign (tb-bctb regression)"
+run_alert_scenario "$SC_9B" refresh "persistent starvation refreshes one alert, closes the duplicate"
+echo "[PASS] 9b: persistent starvation refreshed in place, no duplicate filed"
+run_alert_scenario "$SC_9C" zero-field "zero-field diagnostic rejected at emission and auto-closed"
+echo "[PASS] 9c: zero-field diagnostic suppressed at emission and auto-closed when open"
+echo ""
+
 # Summary
 echo "=== Test Summary ==="
 echo "✓ Endpoint structure valid"
@@ -617,5 +956,6 @@ echo "✓ Diagnostic persistence works"
 echo "✓ Error handling graceful"
 echo "✓ Zero-field alerts suppressed (trailbos-317b7ae2 regression)"
 echo "✓ Dead-worker assignees cleared, live/in_progress/blocked kept (trailbos-4cca2e94)"
+echo "✓ Alert lifecycle: resolved closed with evidence, persistent refreshed, zero-field auto-closed (trailbos-60a684b9)"
 echo ""
 echo "[SUCCESS] All starvation detection tests passed!"

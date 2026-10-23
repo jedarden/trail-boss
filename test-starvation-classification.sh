@@ -28,7 +28,9 @@ mkdir -p "$REGRESSION_DIR/.beads"
 # ---------------------------------------------------------------------------
 # Fixture bead CLI: answers `bead list` from files the TS script writes,
 # records update/create. `update` notes are multi-line, so they are logged
-# between delimiters rather than as one line.
+# between delimiters rather than as one line. A `create`d alert bead is
+# surfaced as an open bead on the next listing, exactly as the real CLI
+# would — that is what lets the dedup invariant be tested for real.
 # ---------------------------------------------------------------------------
 cat > "$REGRESSION_DIR/bead-stub" <<STUB
 #!/usr/bin/env bash
@@ -40,17 +42,20 @@ if [ "\$1" = "update" ]; then
 fi
 if [ "\$1" = "create" ]; then
   printf 'CREATE %s\n' "\$*" >> "\$LOG"
+  printf '{"id":"tb-al-created-%s","title":"created alert","status":"open","assignee":null,"manual_blocked":false,"labels":["alert:starvation:unknown","human","starvation-alert"],"dependencies":[],"notes":"","revision":1,"created_at":"%s"}\n' \\
+    "\$(date +%s%N)" "\$(date -u +%Y-%m-%dT%H:%M:%S)+00:00" >> "\$TB_RUNTIME_OPEN"
   exit 0
 fi
 printf 'bead %s\n' "\$*" >> "\$LOG"
 case "\$*" in
-  *"--status open"*) cat "\$TB_FIXTURE_OPEN" ;;
+  *"--status open"*) { cat "\$TB_FIXTURE_OPEN" 2>/dev/null; cat "\$TB_RUNTIME_OPEN" 2>/dev/null; } ;;
   *"--ready"*) cat "\$TB_FIXTURE_READY" ;;
   *"list --json"*) cat "\$TB_FIXTURE_ALL" ;;
 esac
 exit 0
 STUB
 chmod +x "$REGRESSION_DIR/bead-stub"
+: > "$REGRESSION_DIR/runtime-open.jsonl"
 
 # Heartbeat 90s old so the age renders deterministically as "1m". The offset
 # suffix matters: the box runs EDT, and a timezone-less stamp would be parsed
@@ -179,7 +184,7 @@ fs.writeFileSync(regressionDir + "/fixtures-ready.jsonl", readyBeads.map(b => JS
 fs.writeFileSync(regressionDir + "/fixtures-all.jsonl", allBeads.map(b => JSON.stringify(b)).join("\n") + "\n");
 
 process.chdir(regressionDir); // logStarvationDiagnostic writes under CWD
-const { detectBeadStarvation, validateStarvationAlert } = await import(daemonDir);
+const { detectBeadStarvation, reconcileStarvationAlerts, validateStarvationAlert } = await import(daemonDir);
 
 const diag = await detectBeadStarvation();
 assert(diag !== null, "diagnostic produced for a workspace with excluded beads");
@@ -195,8 +200,14 @@ assert(reasons.includes("bead tb-mystery: no mechanical cause identified"), "une
 assert(!reasons.includes("bead tb-ready"), "ready beads are never given exclusion reasons");
 assert(validateStarvationAlert(diag!).actionable === true, "classified diagnostic passes the alert guard");
 
-// A second detection in the same process must not re-stamp unchanged causes
-await detectBeadStarvation();
+// The detector no longer files alerts itself; the lifecycle does, and only
+// when no starvation alert is already open.
+await reconcileStarvationAlerts(diag);
+
+// A second detection in the same process must not re-stamp unchanged causes,
+// and its lifecycle pass must refresh the existing alert, not file another
+const diag2 = await detectBeadStarvation();
+await reconcileStarvationAlerts(diag2);
 
 // ---------------------------------------------------------------------------
 // Part 3 — stub invocations: notes appended, once per distinct cause-set
@@ -216,6 +227,12 @@ const createIdx = stubLog.indexOf("CREATE ");
 assert(createIdx !== -1, "alert bead filed for the unrecovered starvation");
 assert(stubLog.slice(createIdx).includes("blocked by tb-blocker-open (open)"), "alert description names the classified cause");
 
+// Dedup invariant: two detection cycles, one starvation, exactly one alert
+// bead — the second cycle must not file a duplicate.
+const alertCreates = [...stubLog.matchAll(/^CREATE .*alert:starvation:unknown/gm)].length;
+assert(alertCreates === 1, `exactly one alert filed across both cycles (got ${alertCreates})`);
+assert(!stubLog.slice(createIdx + 1).includes("CREATE "), "second cycle filed no second alert");
+
 if (failures > 0) process.exit(1);
 TS
 
@@ -229,6 +246,7 @@ echo "[setup] running classification tests..."
   TB_FIXTURE_OPEN="$REGRESSION_DIR/fixtures-open.jsonl" \
   TB_FIXTURE_READY="$REGRESSION_DIR/fixtures-ready.jsonl" \
   TB_FIXTURE_ALL="$REGRESSION_DIR/fixtures-all.jsonl" \
+  TB_RUNTIME_OPEN="$REGRESSION_DIR/runtime-open.jsonl" \
     bun "$REGRESSION_DIR/classification.ts"
 )
 
@@ -241,5 +259,6 @@ echo "✓ exclusion_reasons carry the classified causes; ready beads excluded"
 echo "✓ Classification notes append to existing notes, never replace"
 echo "✓ Unchanged cause-sets are not re-stamped"
 echo "✓ Alert description names the classified cause"
+echo "✓ One alert bead across two detection cycles — no duplicate filing"
 echo ""
 echo "[SUCCESS] All starvation classification tests passed!"

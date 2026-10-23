@@ -13,6 +13,55 @@ const BEAD_BIN = process.env.TRAILBOSS_BEAD_BIN || "/home/coding/.local/bin/bead
 // Overridable so tests can exercise both sides of the window.
 const HEARTBEAT_STALE_MS = parseStaleWindowMs(process.env.TRAILBOSS_HEARTBEAT_STALE_MS, 30 * 60 * 1000);
 
+// Minimum interval between in-place refreshes of one alert bead. The detector
+// runs every 60s; without this throttle a persistent starvation would append
+// a near-identical block to the alert's notes every cycle, without bound.
+// Overridable so tests can force a refresh on demand.
+const ALERT_REFRESH_MIN_MS = parseStaleWindowMs(process.env.TRAILBOSS_ALERT_REFRESH_MIN_MS, 10 * 60 * 1000);
+
+// Refresh blocks kept in an alert bead's notes. Each refresh replaces notes
+// wholesale (read-modify-write), so the history is pruned here: the bead's
+// original text survives, older machine-written blocks fall off.
+const ALERT_REFRESH_HISTORY = 5;
+
+// Line that begins a refresh block inside an alert bead's notes, with the ISO
+// timestamp of the refresh as the rest of the line.
+const ALERT_REFRESH_MARKER = "starvation alert refresh @ ";
+
+// Label the alert path stamps on every starvation alert bead. The lifecycle
+// finds the alerts it owns by listing open beads carrying it.
+const STARVATION_ALERT_LABEL = "starvation-alert";
+
+// The labels the harness holds out of claim by design. Three are pluck's own
+// exclude_labels (deferred, human, blocked — ~/.needle/config.yaml, and the
+// harness's starvation events record exclusions as `label:<name>`); the other
+// two are its split vocabulary: `mitosis-parent` is the umbrella a parent
+// carries while only its children are meant to be claimed, and `split-child`
+// marks a bead rescoped into a split (NEEDLE src/strand/analyze.rs
+// SPLIT_CHILD_LABEL). A bead carrying one is invisible to workers on purpose,
+// so its absence from the frontier is not starvation — the tb-bctb false
+// positive was exactly this shape, every excluded bead label-filtered.
+//
+// Note that `bead list --ready` does NOT apply these: the exclude_labels live
+// in pluck's config, not in the bead store, so a held bead sits in the
+// bead-rs frontier too. Any detector that derives exclusions from the
+// open-vs-ready diff alone reads excluded=0 in exactly the cycles pluck is
+// holding beads out (trailbos-383d1150).
+const HOLD_BY_DESIGN_LABELS = new Set([
+  "deferred",
+  "human",
+  "blocked",
+  "mitosis-parent",
+  "split-child",
+]);
+
+// Label prefix pluck quarantines a repeatedly-failing bead with: unclaimable
+// until the timestamp, claimable again once it passes — quarantine fails open
+// (the operator's 290e138 deferral landed precisely because these stamps had
+// already passed and the beads were being reselected). Nanosecond precision;
+// parseTimestamp tolerates it.
+const QUARANTINE_LABEL_PREFIX = "quarantine-until:";
+
 function parseStaleWindowMs(raw: string | undefined, fallback: number): number {
   if (!raw) return fallback;
   const parsed = Number(raw);
@@ -118,13 +167,19 @@ interface StarvationDiagnostic {
   ready_beads: number;
   excluded_beads: number;
   exclusion_reasons: string[];
+  // Per-bead classification behind exclusion_reasons, so the alert lifecycle
+  // can tell a deliberate exclusion from an unexplained one without
+  // re-deriving it. Optional because hand-built diagnostics (tests, incident
+  // replays) predate it.
+  excluded_classifications?: ExcludedBeadClassification[];
   recovered: boolean;
   recovery_attempts: string[];
   error?: string;
 }
 
 // One bead as returned by `bead list --json` (JSONL, one object per line).
-// Only the fields the exclusion classifier reads are declared; the CLI emits more.
+// Only the fields the exclusion classifier and the alert lifecycle read are
+// declared; the CLI emits more.
 interface BeadRecord {
   id: string;
   title: string;
@@ -133,6 +188,9 @@ interface BeadRecord {
   manual_blocked?: boolean;
   dependencies?: Array<{ blocker: string; kind: string }>;
   notes?: string | null;
+  labels?: string[];
+  revision?: number;
+  created_at?: string;
 }
 
 // One line of .beads/heartbeats.jsonl — worker liveness, appended by the fleet
@@ -158,7 +216,9 @@ interface BeadEventEntry {
 // The mechanically-derived reason a bead is not on the ready frontier.
 // `known` is false only when every field the classifier reads came back
 // unremarkable — that residue is exactly what `alert:starvation:unknown`
-// exists for.
+// exists for. `deliberate` is the stronger, benign flag: every cause is a
+// hold-back the harness or an operator chose (pluck label filter, manual
+// block), so the bead's absence from the frontier is not starvation at all.
 export interface ExcludedBeadClassification {
   bead_id: string;
   title: string;
@@ -166,6 +226,7 @@ export interface ExcludedBeadClassification {
   assignee: string | null;
   causes: string[];
   known: boolean;
+  deliberate: boolean;
 }
 
 // Parse JSONL defensively: malformed lines are skipped, not fatal — the
@@ -246,24 +307,71 @@ function formatAge(ageMs: number): string {
 
 const FINISHED_STATUSES = new Set(["closed", "done"]);
 
+// The ids of `bead`'s `blocks` dependencies — the edges that can hold it out
+// of the frontier. Shared by unclosedBlockers and the hold-expiry check, which
+// need the same edge set.
+function blockerRefs(bead: BeadRecord): string[] {
+  const out: string[] = [];
+  for (const dep of bead.dependencies ?? []) {
+    if (dep.kind && dep.kind !== "blocks") continue;
+    out.push(dep.blocker);
+  }
+  return out;
+}
+
 // The `blocks` dependencies of `bead` whose blocker is not finished, with each
 // blocker's status. Shared by the classifier (which names them as causes) and
 // the dead-worker remediation (which needs "assignee is the ONLY exclusion").
 function unclosedBlockers(bead: BeadRecord, statusById: Map<string, string>): Array<{ id: string; status: string }> {
   const out: Array<{ id: string; status: string }> = [];
-  for (const dep of bead.dependencies ?? []) {
-    if (dep.kind && dep.kind !== "blocks") continue;
-    const status = statusById.get(dep.blocker)?.toLowerCase() ?? "unknown";
-    if (!FINISHED_STATUSES.has(status)) out.push({ id: dep.blocker, status });
+  for (const id of blockerRefs(bead)) {
+    const status = statusById.get(id)?.toLowerCase() ?? "unknown";
+    if (!FINISHED_STATUSES.has(status)) out.push({ id, status });
   }
   return out;
 }
 
+// Why a hold-by-design label no longer justifies the bead's invisibility, or
+// null while the hold stands. Two mechanical expiry forms: a
+// `quarantine-until:<ts>` label whose stamp has passed (pluck's quarantine
+// fails open — once the stamp is past, the hold label is the only thing
+// keeping the bead out, so the stamp is the evidence the hold is stale), and
+// a `deferred`/`blocked` hold whose every referenced blocker has since closed:
+// the wait the hold asserted is over. `human`/`mitosis-parent`/`split-child`
+// hold by ownership and structure, not by waiting on anything, so only the
+// waiting labels expire through their blockers. An unparseable quarantine
+// stamp never reads as expired — an unreadable stamp must fail toward "the
+// hold stands", never toward alerting.
+function expiredHoldReason(
+  bead: BeadRecord,
+  statusById: Map<string, string>,
+  nowMs: number
+): string | null {
+  for (const label of bead.labels ?? []) {
+    if (!label.startsWith(QUARANTINE_LABEL_PREFIX)) continue;
+    const raw = label.slice(QUARANTINE_LABEL_PREFIX.length);
+    const until = parseTimestamp(raw);
+    if (until > 0 && until <= nowMs) {
+      return `${QUARANTINE_LABEL_PREFIX}${raw} passed ${formatAge(nowMs - until)} ago`;
+    }
+  }
+
+  const waiting = (bead.labels ?? []).filter(label => label === "deferred" || label === "blocked");
+  const refs = blockerRefs(bead);
+  if (waiting.length > 0 && refs.length > 0 && unclosedBlockers(bead, statusById).length === 0) {
+    const closed = refs.map(id => `${id} (${statusById.get(id)?.toLowerCase() ?? "unknown"})`).join(", ");
+    return `every referenced blocker has finished (${closed}) — the '${waiting.join("', '")}' hold waits on nothing`;
+  }
+  return null;
+}
+
 // Classify one excluded bead's invisibility cause from bead data alone — no
 // human judgment, every cause read from fields that already exist.
-// Precedence: manual_blocked is deliberate and ends the classification; an
-// in_progress bead reports its worker's heartbeat; an open bead reports a
-// dead-assignee candidate and/or its unclosed blockers.
+// Precedence: manual_blocked and the pluck exclude labels are deliberate
+// hold-backs and end the classification (a label hold only while its
+// rationale — quarantine stamp, waiting set — is still live); an in_progress
+// bead reports its worker's heartbeat; an open bead reports a dead-assignee
+// candidate and/or its unclosed blockers.
 export function classifyExcludedBead(
   bead: BeadRecord,
   statusById: Map<string, string>,
@@ -280,11 +388,39 @@ export function classifyExcludedBead(
     assignee,
     causes: [],
     known: true,
+    deliberate: false,
   };
 
   // (d) manual_blocked: the flag is deliberate — record it and skip the dig.
   if (bead.manual_blocked) {
     base.causes = ["manually blocked (deliberate flag; not classified further)"];
+    base.deliberate = true;
+    return base;
+  }
+
+  // (e) pluck exclude labels: the harness holds these out of the frontier by
+  // design, so the exclusion is chosen, not broken. This is the tb-bctb
+  // "all beads label-filtered" shape — including the alert beads themselves,
+  // which carry `human` and were then counted as starved by their own alert.
+  // The hold only stays deliberate while its rationale does: an expired
+  // quarantine stamp or a fully-closed blocker set classifies as a stale hold
+  // (deliberate=false), so the alert names it as evidence instead of waving
+  // the bead through as chosen (trailbos-383d1150).
+  const labelFiltered = (bead.labels ?? []).filter(label => HOLD_BY_DESIGN_LABELS.has(label));
+  if (labelFiltered.length > 0) {
+    const expiry = expiredHoldReason(bead, statusById, nowMs);
+    if (expiry !== null) {
+      base.causes = [
+        `hold expired: ${expiry}; label filter (${labelFiltered.map(label => `'${label}'`).join(", ")}) ` +
+        `still applied but no longer explains the invisibility`,
+      ];
+      base.deliberate = false;
+      return base;
+    }
+    base.causes = [
+      `excluded by label filter (${labelFiltered.map(label => `'${label}'`).join(", ")}) — deliberate, not starvation`,
+    ];
+    base.deliberate = true;
     return base;
   }
 
@@ -594,6 +730,7 @@ export async function detectBeadStarvation(): Promise<StarvationDiagnostic | nul
       ready_beads: readyCount,
       excluded_beads: excludedCount,
       exclusion_reasons: exclusionReasons,
+      excluded_classifications: classifications,
       recovered: false,
       recovery_attempts: [],
     };
@@ -655,11 +792,10 @@ export async function detectBeadStarvation(): Promise<StarvationDiagnostic | nul
     // Log diagnostic payload
     logStarvationDiagnostic(diagnostic);
 
-    // Create alert bead if recovery failed
-    if (!diagnostic.recovered) {
-      createStarvationAlertBead(diagnostic);
-    }
-
+    // Alert beads are not filed here: the alert lifecycle owns them
+    // (reconcileStarvationAlerts), so a persistent starvation refreshes one
+    // bead instead of filing a duplicate every cycle, and a resolved one is
+    // closed instead of left to rot.
     return diagnostic;
   } catch (err) {
     console.error("[starvation] detection error:", err);
@@ -763,9 +899,12 @@ cross-linked to trailbos-317b7ae2).`;
   }
 }
 
-// Create a starvation alert bead. Self-inconsistent diagnostics are never
-// alerted: they are routed to .beads/diagnostics/ and reported as a detector
-// bug instead.
+// Create a starvation alert bead. Called only from the alert lifecycle, which
+// has already established that no starvation alert is open — that is the
+// dedup: a persistent starvation refreshes its one alert instead of re-filing
+// one per 60s cycle (the old behavior stacked up 263 beads in this
+// workspace). Self-inconsistent diagnostics are never alerted: they are
+// routed to .beads/diagnostics/ and reported as a detector bug instead.
 export function createStarvationAlertBead(diagnostic: StarvationDiagnostic): void {
   const validation = validateStarvationAlert(diagnostic);
   if (!validation.actionable) {
@@ -813,6 +952,293 @@ ${diagnostic.error ? `**Error:** ${diagnostic.error}` : ""}`;
   }
 }
 
+// ---------------------------------------------------------------------------
+// Alert lifecycle (trailbos-60a684b9): the loop that detects starvation also
+// resolves its own alerts. Every 60s cycle the live state is compared against
+// the open starvation-alert beads; each one is closed with evidence when the
+// live state disproves it, refreshed in place when starvation genuinely
+// persists, and a new alert is filed only when none is open. Invariant: at
+// most one open starvation-alert bead per workspace at any time.
+// ---------------------------------------------------------------------------
+
+// What the lifecycle should do with the open alert beads this cycle.
+// `close` carries the evidence quoted verbatim into the close reason.
+type StarvationAlertCloseKind = "resolved" | "invalid" | "benign" | "duplicate";
+export type StarvationAlertAction =
+  | { action: "close"; kind: StarvationAlertCloseKind; evidence: string }
+  | { action: "refresh" }
+  | { action: "none"; reason: string };
+
+// Fresh open/ready/excluded counts, used for close evidence and to tell "no
+// starvation" apart from "detection failed". Returns null when the bead CLI
+// cannot be consulted — an absent reading never closes anything.
+function readFrontierCounts(workspaceRoot: string): { open: number; ready: number; excluded: number } | null {
+  try {
+    const openResult = execSync(`cd "${workspaceRoot}" && ${BEAD_BIN} list --status open --json --limit ${BEAD_LIST_LIMIT} 2>/dev/null`, {
+      encoding: "utf-8",
+      timeout: 10000,
+    });
+    const open = openResult.trim().split("\n").filter(line => line.trim()).length;
+    const ready = countReadyBeads(workspaceRoot);
+    return { open, ready, excluded: Math.max(0, open - ready) };
+  } catch (err) {
+    console.error("[starvation] failed to read frontier counts:", err);
+    return null;
+  }
+}
+
+// Decide what the lifecycle must do with the open starvation-alert beads, from
+// the live diagnostic alone. Close (false positive) when the live state
+// disproves the alert; refresh when starvation genuinely persists; take no
+// action when the evidence is not there to decide either way.
+export async function decideStarvationAlertAction(
+  diagnostic: StarvationDiagnostic | null,
+  workspaceRoot: string
+): Promise<StarvationAlertAction> {
+  if (diagnostic === null) {
+    // detectBeadStarvation() returns null both when the workspace genuinely
+    // has no starvation and when detection itself failed. Only a fresh
+    // frontier read distinguishes the two — an alert is never closed on a
+    // detector error.
+    const counts = readFrontierCounts(workspaceRoot);
+    if (!counts) {
+      return { action: "none", reason: "frontier counts unavailable; leaving open alerts as they stand" };
+    }
+    if (counts.open === 0 || counts.excluded === 0) {
+      return {
+        action: "close",
+        kind: "resolved",
+        evidence: `no starvation on a fresh read: ${counts.open} open beads, ${counts.ready} ready, ${counts.excluded} excluded (nothing held outside the ready frontier)`,
+      };
+    }
+    return {
+      action: "none",
+      reason: `diagnostic was null but a fresh read still shows ${counts.excluded} excluded beads; taking no alert action this cycle`,
+    };
+  }
+
+  if (diagnostic.recovered) {
+    return {
+      action: "close",
+      kind: "resolved",
+      evidence:
+        `starvation recovered: ${diagnostic.open_beads} open beads, ${diagnostic.ready_beads} ready, ` +
+        `${diagnostic.excluded_beads} excluded. Recovery: ${diagnostic.recovery_attempts.join("; ") || "none recorded"}`,
+    };
+  }
+
+  const validation = validateStarvationAlert(diagnostic);
+  if (!validation.actionable) {
+    return {
+      action: "close",
+      kind: "invalid",
+      evidence:
+        `the diagnostic behind this alert is not actionable: ${validation.reason} ` +
+        `(counts open=${diagnostic.open_beads} ready=${diagnostic.ready_beads} ` +
+        `excluded=${diagnostic.excluded_beads}, workspace '${diagnostic.workspace}') — ` +
+        `the trailbos-8cae488d blank-workspace/zero-field shape`,
+    };
+  }
+
+  // Deliberate-exclusion shape: workers still have claimable work (frontier
+  // non-empty) and every excluded bead is held back on purpose (pluck label
+  // filter or manual block). Nothing is silently stuck — the tb-bctb
+  // "all beads label-filtered" false positive.
+  const classifications = diagnostic.excluded_classifications ?? [];
+  if (
+    diagnostic.ready_beads > 0 &&
+    classifications.length > 0 &&
+    classifications.every(c => c.deliberate)
+  ) {
+    const causes = classifications.map(c => `bead ${c.bead_id}: ${c.causes.join("; ")}`).join("; ");
+    return {
+      action: "close",
+      kind: "benign",
+      evidence:
+        `ready frontier non-empty (${diagnostic.ready_beads} of ${diagnostic.open_beads} open beads ` +
+        `visible to pluck) and every excluded bead is held back deliberately: ${causes}`,
+    };
+  }
+
+  return { action: "refresh" };
+}
+
+// Open beads carrying the starvation-alert label, oldest first — the oldest is
+// the canonical alert when more than one is open (the pre-lifecycle detector
+// filed a fresh bead on every failed recovery). Returns null when the bead CLI
+// cannot be consulted, so a listing failure never reads as "no alerts open"
+// and files a duplicate.
+export function listOpenStarvationAlerts(workspaceRoot: string): BeadRecord[] | null {
+  try {
+    const result = execSync(`cd "${workspaceRoot}" && ${BEAD_BIN} list --status open --json --limit ${BEAD_LIST_LIMIT} 2>/dev/null`, {
+      encoding: "utf-8",
+      timeout: 10000,
+    });
+    return parseJsonl<BeadRecord>(result)
+      .filter(bead => Array.isArray(bead.labels) && bead.labels.includes(STARVATION_ALERT_LABEL))
+      .sort((a, b) => parseTimestamp(a.created_at) - parseTimestamp(b.created_at));
+  } catch (err) {
+    console.error("[starvation] failed to list open starvation alerts:", err);
+    return null;
+  }
+}
+
+// Timestamp of the newest refresh block already in an alert bead's notes, or 0
+// when it has never been refreshed.
+function lastRefreshAtMs(notes: string): number {
+  let newest = 0;
+  for (const line of notes.split("\n")) {
+    if (!line.startsWith(ALERT_REFRESH_MARKER)) continue;
+    const ts = parseTimestamp(line.slice(ALERT_REFRESH_MARKER.length).trim());
+    if (ts > newest) newest = ts;
+  }
+  return newest;
+}
+
+// Existing notes rewritten to make room for a new refresh block: the text
+// before the first block is preserved untouched (operator content), and only
+// the newest few machine-written blocks are kept.
+function mergeRefreshNotes(existing: string, block: string): string {
+  const lines = existing.split("\n");
+  const markerIdx: number[] = [];
+  lines.forEach((line, i) => {
+    if (line.startsWith(ALERT_REFRESH_MARKER)) markerIdx.push(i);
+  });
+
+  const prelude = markerIdx.length === 0
+    ? existing.trimEnd()
+    : lines.slice(0, markerIdx[0]).join("\n").trimEnd();
+  const keptFrom = markerIdx[Math.max(0, markerIdx.length - (ALERT_REFRESH_HISTORY - 1))];
+  const kept = markerIdx.length === 0 ? "" : lines.slice(keptFrom).join("\n").trimEnd();
+
+  return [prelude, kept, block.trimEnd()].filter(part => part !== "").join("\n\n");
+}
+
+// Close one alert bead, quoting the evidence into the required close reason.
+// Failure is logged, never thrown: a close that cannot land retries on the
+// next cycle against the still-open bead.
+function closeStarvationAlert(
+  alert: BeadRecord,
+  action: { kind: StarvationAlertCloseKind; evidence: string },
+  workspaceRoot: string
+): void {
+  const reason = `Auto-closed by the starvation alert lifecycle (${action.kind}). ${action.evidence}`;
+  try {
+    // argv array, not a shell string: the evidence carries free-form cause
+    // text that must never be reinterpreted by a shell.
+    execFileSync(BEAD_BIN, ["close", alert.id, "--reason", reason], {
+      encoding: "utf-8",
+      timeout: 30000,
+      cwd: workspaceRoot,
+    });
+    console.log(`[starvation] closed alert bead ${alert.id} (${action.kind})`);
+  } catch (err) {
+    console.error(`[starvation] failed to close alert bead ${alert.id}:`, err);
+  }
+}
+
+// Refresh one alert bead in place instead of filing a duplicate: fresh counts,
+// timestamp, recovery attempts, and exclusion reasons, appended after the
+// existing notes (read-modify-write — `bead update --notes` REPLACES), guarded
+// by --if-revision so a concurrent edit is never clobbered. Throttled so a
+// persistent starvation appends a block every ALERT_REFRESH_MIN_MS, not every
+// 60s cycle.
+function refreshStarvationAlert(
+  alert: BeadRecord,
+  diagnostic: StarvationDiagnostic,
+  workspaceRoot: string
+): void {
+  const existing = alert.notes;
+  if (existing === undefined || existing === null) {
+    // Same refusal rule as recordExclusionNote: notes the snapshot could not
+    // read must never be replaced — losing an operator's text is a worse
+    // mutation than missing one refresh.
+    console.error(`[starvation] skipping refresh of ${alert.id}: existing notes unreadable, refusing to replace`);
+    return;
+  }
+  if (typeof alert.revision !== "number") {
+    console.error(`[starvation] skipping refresh of ${alert.id}: revision unknown, refusing an unguarded write`);
+    return;
+  }
+
+  const nowMs = Date.now();
+  const newestWrite = Math.max(parseTimestamp(alert.created_at ?? ""), lastRefreshAtMs(existing));
+  if (newestWrite > 0 && nowMs - newestWrite < ALERT_REFRESH_MIN_MS) {
+    console.log(`[starvation] alert ${alert.id} written ${formatAge(nowMs - newestWrite)} ago; refresh throttled`);
+    return;
+  }
+
+  const block = [
+    ALERT_REFRESH_MARKER + new Date(nowMs).toISOString(),
+    `still starved: open=${diagnostic.open_beads} ready=${diagnostic.ready_beads} excluded=${diagnostic.excluded_beads}`,
+    ...diagnostic.exclusion_reasons.map(reason => `- ${reason}`),
+    ...diagnostic.recovery_attempts.map(attempt => `- ${attempt}`),
+  ].join("\n");
+
+  try {
+    execFileSync(
+      BEAD_BIN,
+      ["update", alert.id, "--notes", mergeRefreshNotes(existing.trimEnd(), block), "--if-revision", String(alert.revision)],
+      { encoding: "utf-8", timeout: 30000, cwd: workspaceRoot }
+    );
+    console.log(`[starvation] refreshed alert bead ${alert.id} in place (revision ${alert.revision})`);
+  } catch (err) {
+    // A revision conflict means someone edited the bead mid-cycle; skipping
+    // loses nothing — the next cycle re-reads and retries with fresh numbers.
+    console.error(`[starvation] failed to refresh alert bead ${alert.id} (revision moved?):`, err);
+  }
+}
+
+// Reconcile the open starvation-alert beads against the live diagnostic.
+// Wired into the 60s startStarvationDetection loop right after
+// detectBeadStarvation(), whose result this consumes.
+export async function reconcileStarvationAlerts(diagnostic: StarvationDiagnostic | null): Promise<void> {
+  const workspace = process.env.PWD || process.cwd();
+  const workspaceRoot = workspace.endsWith("/daemon") ? workspace.slice(0, -7) : workspace;
+
+  const alerts = listOpenStarvationAlerts(workspaceRoot);
+  if (alerts === null) {
+    console.error("[starvation] alert lifecycle skipped: open alerts could not be listed");
+    return;
+  }
+
+  const action = await decideStarvationAlertAction(diagnostic, workspaceRoot);
+  if (action.action === "none") {
+    console.log(`[starvation] alert lifecycle: no action (${action.reason})`);
+    return;
+  }
+
+  if (alerts.length === 0) {
+    if (action.action === "close") return; // nothing open to close
+    // refresh verdict + no open alert => this cycle files the first alert
+    createStarvationAlertBead(diagnostic!);
+    return;
+  }
+
+  if (action.action === "close") {
+    for (const alert of alerts) closeStarvationAlert(alert, action, workspaceRoot);
+    return;
+  }
+
+  // Starvation persists: keep the oldest alert as the single open one, fold
+  // any extras into it, and refresh it with this cycle's numbers.
+  const [canonical, ...duplicates] = alerts;
+  for (const dup of duplicates) {
+    closeStarvationAlert(
+      dup,
+      {
+        kind: "duplicate",
+        evidence:
+          `starvation persists and is tracked on ${canonical.id}; at most one open starvation ` +
+          `alert per workspace. Live counts: open=${diagnostic!.open_beads} ready=${diagnostic!.ready_beads} ` +
+          `excluded=${diagnostic!.excluded_beads}`,
+      },
+      workspaceRoot
+    );
+  }
+  refreshStarvationAlert(canonical, diagnostic!, workspaceRoot);
+}
+
 // Start starvation detection loop (runs every 60 seconds)
 export function startStarvationDetection(intervalMs: number = 60000): void {
   console.log(`[starvation] started detection loop (interval ${intervalMs}ms)`);
@@ -823,9 +1249,15 @@ export function startStarvationDetection(intervalMs: number = 60000): void {
       if (diagnostic.recovered) {
         console.log(`[starvation] recovery successful`);
       } else {
-        console.log(`[starvation] recovery failed; diagnostic dispatched (alert bead, or detector-bug bead if non-actionable)`);
+        console.log(`[starvation] recovery failed; dispatching alert lifecycle`);
       }
     }
+    // The lifecycle owns the alert beads: it closes the ones the live state
+    // disproves, refreshes the one a persistent starvation justifies, and
+    // files a new alert only when none is open. It also runs on the cycles
+    // where detection returned null — that is exactly when a stale alert must
+    // be closed.
+    await reconcileStarvationAlerts(diagnostic);
   }, intervalMs);
 }
 
