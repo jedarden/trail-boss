@@ -33,3 +33,6 @@ bin/trailboss-tui
 .beads/*.temp
 .beads/*.journal
 .br_recovery/
+
+# Generated verification output
+test-results/

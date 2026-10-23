@@ -1,2 +1,9 @@
 bead_cli:
   backend: bead-rs
+
+gates:
+  - type: command
+    run_in: clean
+    commands:
+      - bun test
+      - bash test-starvation-classification.sh
