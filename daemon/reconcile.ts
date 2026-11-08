@@ -1362,6 +1362,14 @@ export function reconcileStuckDirection(): { enqueued: number; checked: number }
     const { isStuck, lastAssistantTime } = detectStuckFromTranscriptTail(sess.transcript_path);
 
     if (isStuck && lastAssistantTime !== null) {
+      // Skip when the session has demonstrably progressed past this stuck
+      // point: a UserPromptSubmit unstuck at or after the last assistant turn
+      // means the operator already answered it and the transcript tail is
+      // merely stale (e.g. the prompt entry has not flushed yet). Same
+      // supersession semantics as isEventSuperseded, applied to reconcile.
+      if (sess.last_unstuck_at != null && sess.last_unstuck_at >= lastAssistantTime) {
+        continue;
+      }
       // Enqueue with reason=stopped and stuck_at derived from assistant timestamp
       enqueue(sess.session_id, "stopped", lastAssistantTime);
 

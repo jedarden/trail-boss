@@ -265,9 +265,10 @@ export function getSessionsNotInQueue(limit: number = 100): Array<{
   pane_id: string;
   transcript_path: string;
   cwd: string;
+  last_unstuck_at: number | null;
 }> {
   const stmt = db.prepare(`
-    SELECT s.session_id, s.pane_id, s.transcript_path, s.cwd
+    SELECT s.session_id, s.pane_id, s.transcript_path, s.cwd, s.last_unstuck_at
     FROM sessions s
     LEFT JOIN queue q ON s.session_id = q.session_id AND q.dequeued_at IS NULL
     WHERE q.session_id IS NULL

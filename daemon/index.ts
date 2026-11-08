@@ -85,7 +85,11 @@ function replaySpool(): { replayed: number; failed: number } {
       } else if (isUnstuckEvent(event)) {
         dequeue(event.sessionId);
         markSessionUnstuck(event.sessionId, event.timestamp);
-        dequeueByPaneId(event.paneId, event.sessionId, event.timestamp);
+        // UnstuckEvent carries no paneId (normalized schema), so use the pane
+        // id from the spool record: this is what cleans up a bootstrap
+        // synthetic entry queued under the pane when the real session's
+        // prompt arrives.
+        dequeueByPaneId(paneId, event.sessionId, event.timestamp);
         console.log(`[spool] unstuck: ${event.sessionId.slice(0, 8)}`);
       } else if (isSessionRegistered(event)) {
         if (isEventSuperseded(event.sessionId, event.timestamp)) {
@@ -225,11 +229,14 @@ const server = http.createServer(async (req, res) => {
           console.log(`[event] stuck: ${event.sessionId.slice(0, 8)} (${event.reason})`);
         }
       } else if (isUnstuckEvent(event)) {
-        // Dequeue by session_id; also clean up any bootstrap entry for this pane
+        // Dequeue by session_id; also clean up any bootstrap entry for this pane.
+        // UnstuckEvent carries no paneId (normalized schema), so use the
+        // X-Tmux-Pane header — event.paneId would be undefined here and the
+        // bootstrap cleanup would silently never run.
         const sess = getSession(event.sessionId);
         dequeue(event.sessionId);
         markSessionUnstuck(event.sessionId, event.timestamp);
-        dequeueByPaneId(event.paneId, event.sessionId, event.timestamp);
+        dequeueByPaneId(paneId, event.sessionId, event.timestamp);
         console.log(`[event] unstuck: ${event.sessionId.slice(0, 8)}`);
         // Auto-jump if enabled and this was the operator's current pane
         if (sess) {

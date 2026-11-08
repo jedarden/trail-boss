@@ -504,3 +504,152 @@ describe("POST /event/normalized", () => {
     await expectNormalized({ type: "ended", sessionId, timestamp }, { status: 200, json: { ok: true } });
   });
 });
+
+describe("POST /event UserPromptSubmit unstuck workflow", () => {
+  const expectHook = (
+    hookEventName: string,
+    paneId: string,
+    sessionId: string,
+    extra: Record<string, unknown> = {},
+  ): Promise<void> => {
+    const response = fetch(`${baseUrl}/event`, {
+      method: "POST",
+      headers: { "content-type": "application/json", "x-tmux-pane": paneId },
+      body: JSON.stringify({
+        session_id: sessionId,
+        transcript_path: "",
+        cwd: repoRoot,
+        hook_event_name: hookEventName,
+        ...extra,
+      }),
+    }).then(async (res) => ({ status: res.status, json: await res.json() as Record<string, unknown> }));
+    return expectResponse(
+      response,
+      { status: 200, json: { ok: true } },
+      `POST /event ${hookEventName} session=${sessionId} pane=${paneId}`,
+    );
+  };
+
+  test("UserPromptSubmit dequeues a Stop-queued session and records the progress marker", async () => {
+    const sessionId = `unstuck-lifecycle-${crypto.randomUUID()}`;
+    const paneId = `%${sessionId}`;
+    const db = new Database(join(dataDir, "trailboss.db"));
+    const liveQueueRows = () =>
+      db.query("SELECT COUNT(*) AS count FROM queue WHERE session_id = ? AND dequeued_at IS NULL").get(sessionId) as { count: number };
+
+    try {
+      await expectHook("Stop", paneId, sessionId, { last_assistant_message: "Done. Anything else?" });
+      expect(liveQueueRows().count).toBe(1);
+      expect((await (await fetch(`${baseUrl}/queue`)).json()).count).toBe(1);
+
+      await expectHook("UserPromptSubmit", paneId, sessionId);
+      expect(liveQueueRows().count).toBe(0);
+      expect((await (await fetch(`${baseUrl}/queue`)).json()).count).toBe(0);
+      expect((await (await fetch(`${baseUrl}/status`)).json()).stuckCount).toBe(0);
+
+      // The session stays registered for monitoring; the queue row is retired,
+      // not deleted, and the unstuck progress marker is recorded so a retried
+      // Stop cannot resurrect the entry.
+      expect(db.query("SELECT pane_id FROM sessions WHERE session_id = ?").get(sessionId)).toEqual({ pane_id: paneId });
+      expect(db.query("SELECT dequeued_at FROM queue WHERE session_id = ?").all(sessionId)).toEqual([
+        { dequeued_at: expect.any(Number) },
+      ]);
+      expect(db.query("SELECT last_unstuck_at FROM sessions WHERE session_id = ?").get(sessionId)).toEqual({
+        last_unstuck_at: expect.any(Number),
+      });
+    } finally {
+      db.query("DELETE FROM queue WHERE session_id = ?").run(sessionId);
+      db.query("DELETE FROM sessions WHERE session_id = ?").run(sessionId);
+      db.close();
+    }
+  });
+
+  test("repeated prompt cycles dequeue on every prompt", async () => {
+    const sessionId = `unstuck-repeat-${crypto.randomUUID()}`;
+    const paneId = `%${sessionId}`;
+    const db = new Database(join(dataDir, "trailboss.db"));
+    const liveQueueRows = () =>
+      db.query("SELECT COUNT(*) AS count FROM queue WHERE session_id = ? AND dequeued_at IS NULL").get(sessionId) as { count: number };
+
+    try {
+      for (let cycle = 1; cycle <= 3; cycle++) {
+        await expectHook("Stop", paneId, sessionId, { last_assistant_message: `stuck cycle ${cycle}` });
+        expect(liveQueueRows().count, `cycle ${cycle} after Stop`).toBe(1);
+        await expectHook("UserPromptSubmit", paneId, sessionId);
+        expect(liveQueueRows().count, `cycle ${cycle} after UserPromptSubmit`).toBe(0);
+      }
+
+      // One queue history row per stuck episode, all retired by a prompt.
+      expect(db.query("SELECT COUNT(*) AS count FROM queue WHERE session_id = ?").get(sessionId)).toEqual({ count: 3 });
+      expect(db.query("SELECT COUNT(*) AS count FROM queue WHERE session_id = ? AND dequeued_at IS NULL").get(sessionId)).toEqual({ count: 0 });
+      expect(db.query("SELECT session_id FROM sessions WHERE session_id = ?").get(sessionId)).toEqual({ session_id: sessionId });
+    } finally {
+      db.query("DELETE FROM queue WHERE session_id = ?").run(sessionId);
+      db.query("DELETE FROM sessions WHERE session_id = ?").run(sessionId);
+      db.close();
+    }
+  });
+
+  test("a prompt arriving before any stuck event is a clean no-op and the later stuck still applies", async () => {
+    const sessionId = `unstuck-early-${crypto.randomUUID()}`;
+    const paneId = `%${sessionId}`;
+    const db = new Database(join(dataDir, "trailboss.db"));
+    const liveQueueRows = () =>
+      db.query("SELECT COUNT(*) AS count FROM queue WHERE session_id = ? AND dequeued_at IS NULL").get(sessionId) as { count: number };
+
+    try {
+      // Prompt for a session the daemon has never seen: accepted, but creates
+      // no session row and no queue state.
+      await expectHook("UserPromptSubmit", paneId, sessionId);
+      expect(db.query("SELECT session_id FROM sessions WHERE session_id = ?").get(sessionId)).toBeNull();
+      expect(liveQueueRows().count).toBe(0);
+
+      // Registered but not queued — the second prompt is still a no-op.
+      await expectHook("SessionStart", paneId, sessionId);
+      expect(db.query("SELECT pane_id FROM sessions WHERE session_id = ?").get(sessionId)).toEqual({ pane_id: paneId });
+      await expectHook("UserPromptSubmit", paneId, sessionId);
+      expect(liveQueueRows().count).toBe(0);
+
+      // The subsequent Stop is a fresh event, not a stale retry: it queues.
+      await expectHook("Stop", paneId, sessionId, { last_assistant_message: "waiting for input" });
+      expect(liveQueueRows().count).toBe(1);
+
+      // And the next prompt dequeues it.
+      await expectHook("UserPromptSubmit", paneId, sessionId);
+      expect(liveQueueRows().count).toBe(0);
+    } finally {
+      db.query("DELETE FROM queue WHERE session_id = ?").run(sessionId);
+      db.query("DELETE FROM sessions WHERE session_id = ?").run(sessionId);
+      db.close();
+    }
+  });
+
+  test("a prompt unstuck clears a queued bootstrap pane entry for the real session", async () => {
+    const paneId = `%bootstrap-${crypto.randomUUID()}`;
+    const sessionId = `real-${crypto.randomUUID()}`;
+    const db = new Database(join(dataDir, "trailboss.db"));
+
+    try {
+      // Bootstrap synthetic entry queued under the pane id...
+      await expectHook("Stop", paneId, paneId, { last_assistant_message: "waiting for input" });
+      expect(db.query("SELECT COUNT(*) AS count FROM queue WHERE session_id = ? AND dequeued_at IS NULL").get(paneId)).toEqual({ count: 1 });
+
+      // ...then the real session's prompt arrives before its own stuck event:
+      // the synthetic pane entry is removed, the real session is not created.
+      await expectHook("UserPromptSubmit", paneId, sessionId);
+      expect(db.query("SELECT session_id FROM sessions WHERE session_id = ?").get(paneId)).toBeNull();
+      expect(db.query("SELECT id FROM queue WHERE session_id = ?").all(paneId)).toEqual([]);
+      expect(db.query("SELECT session_id FROM sessions WHERE session_id = ?").get(sessionId)).toBeNull();
+
+      // The real stuck event afterwards still queues the real session.
+      await expectHook("Stop", paneId, sessionId, { last_assistant_message: "waiting for input" });
+      expect(db.query("SELECT COUNT(*) AS count FROM queue WHERE session_id = ? AND dequeued_at IS NULL").get(sessionId)).toEqual({ count: 1 });
+    } finally {
+      db.query("DELETE FROM queue WHERE session_id = ?").run(sessionId);
+      db.query("DELETE FROM sessions WHERE session_id = ?").run(sessionId);
+      db.query("DELETE FROM queue WHERE session_id = ?").run(paneId);
+      db.query("DELETE FROM sessions WHERE session_id = ?").run(paneId);
+      db.close();
+    }
+  });
+});
