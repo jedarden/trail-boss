@@ -4,7 +4,7 @@
 
 This document specifies the complete contract for the tmux detector (`bin/trailboss-tmux-detector` → `daemon/tmux-detector.ts`) to submit events to the Trail Boss daemon.
 
-**Note:** This contract is based on the normalized event API design decision (docs/notes/decisions.md). The daemon implementation may currently only support the legacy `/event` endpoint; see Implementation Status below.
+**Note:** This contract is based on the normalized event API design decision (docs/notes/decisions.md). The endpoint is implemented and verified live — see Implementation Status below. The legacy `/event` endpoint remains available in parallel for Claude Code hooks, which submit the raw HookEvent format with an `X-Tmux-Pane` header and are adapted server-side.
 
 ## HTTP Request
 
@@ -117,9 +117,12 @@ Content-Type: application/json
 | Status | Body Example | Description |
 |--------|--------------|-------------|
 | `400 Bad Request` | `{"error": "Invalid JSON"}` | Request body is not valid JSON |
-| `400 Bad Request` | `{"error": "Missing type field"}` | Event payload missing `type` discriminator |
-| `400 Bad Request` | `{"error": "Unknown event type"}` | Invalid `type` value |
+| `400 Bad Request` | `{"error": "Invalid or missing event type"}` | Payload is not a JSON object, or `type` is missing, empty, or not a string |
+| `400 Bad Request` | `{"error": "Unknown event type"}` | `type` is a string but not one of the four supported values |
+| `400 Bad Request` | `{"error": "Invalid event fields"}` | A supported event type is missing a required field or a field has an invalid value (e.g. `timestamp` not a finite number > 0, empty `sessionId`/`paneId`/`message`, `reason` other than `stopped`/`permission`) |
 | `500 Internal Server Error` | `{"error": "Internal server error"}` | Server-side processing error |
+
+A rejected request changes no session or queue state; see `docs/notes/normalized-event-contract.md` for the complete validation rules and retry semantics.
 
 ## Error Handling
 
@@ -229,20 +232,20 @@ curl -X POST http://127.0.0.1:4000/event/normalized \
 
 Expected response:
 ```json
-{"error":"Invalid event: unknown type 'invalid_type'"}
+{"error":"Unknown event type"}
 ```
 
 ## Implementation Status
 
-**Current State:** As of 2026-07-02, the daemon (`daemon/index.ts`) only implements the legacy `/event` endpoint, which expects:
-- `X-Tmux-Pane` header
-- Raw HookEvent format (Claude Code-specific)
+✅ **Implemented and verified live** — `POST /event/normalized` is implemented in `daemon/index.ts` and is the endpoint the tmux detector emits to, exactly as specified above (see `docs/notes/decisions.md` "Normalized event API endpoint"). The legacy `/event` endpoint remains available in parallel for Claude Code hooks.
 
-**Planned State:** The `/event/normalized` endpoint documented here is the design target (see docs/notes/decisions.md "Normalized event API endpoint").
+**Verified 2026-11-08** against the running daemon (`trailboss-daemon.service`, `http://127.0.0.1:4000`) and the daemon integration suite (`daemon/normalized-event.test.ts`, which spawns a real daemon instance and exercises every case over HTTP via `scripts/definition-of-done.sh`):
 
-**Migration Path:** The tmux detector should emit to `/event/normalized` as specified here. Until that endpoint is implemented, the detector may need to:
-1. Use the legacy `/event` endpoint with adapter wrapper, OR
-2. Wait for `/event/normalized` implementation
+- All four event types (`registered`, `stuck`, `unstuck`, `ended`) return `200 {"ok": true}` and produce the documented state effect (registration stores the session; stuck enqueues with `reason`; unstuck dequeues and records the progress marker; ended removes the session and tombstones it).
+- Validation matches `docs/notes/normalized-event-contract.md`: non-JSON body → `400 {"error": "Invalid JSON"}`; missing/empty/non-string `type` → `400 {"error": "Invalid or missing event type"}`; a string `type` outside the four supported values → `400 {"error": "Unknown event type"}`; missing or invalid fields (`timestamp` must be a finite number > 0, `sessionId`/`paneId`/`message` non-empty, `reason` exactly `stopped` or `permission`) → `400 {"error": "Invalid event fields"}`. Rejected requests change no session or queue state.
+- Retries are idempotent: a duplicate event returns the same `200 {"ok": true}` without duplicating queue entries, and a retry that arrives after the session progressed (unstuck) or ended resurrects nothing (see `docs/notes/normalized-event-schema.md` retry semantics).
+
+The earlier caveat on this page — and the `[emit] Daemon error: 404 - Not found` observed in acceptance run `tmux-detector-20260702-114229` — described the daemon as of 2026-07-02, before the endpoint was implemented on 2026-10-11. They no longer apply.
 
 ## Detector Configuration
 
