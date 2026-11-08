@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
 )
@@ -13,6 +14,24 @@ import (
 func TestPreviewFollowsSelectionAndQueueRefresh(t *testing.T) {
 	target := filepath.Join(t.TempDir(), "target")
 	t.Setenv("TRAILBOSS_PREVIEW_TARGET_FILE", target)
+	stubDir := t.TempDir()
+	stub := `#!/bin/sh
+case "$1" in
+  display-message)
+    case "$*" in
+      *pane_height*) echo 4;;
+      *) echo '0 preview:session';;
+    esac;;
+  capture-pane)
+    for target do :; done
+    printf 'captured content from %s\n' "$target";;
+  *) exit 1;;
+esac
+`
+	if err := os.WriteFile(filepath.Join(stubDir, "tmux"), []byte(stub), 0755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", stubDir+":"+os.Getenv("PATH"))
 	m := NewModel()
 	update := func(msg tea.Msg) {
 		t.Helper()
@@ -25,14 +44,40 @@ func TestPreviewFollowsSelectionAndQueueRefresh(t *testing.T) {
 		if err != nil || string(got) != want {
 			t.Fatalf("preview target = %q, err = %v; want %q", got, err, want)
 		}
+		cmd := exec.Command("bash", "../bin/trailboss-preview", "--once")
+		out, err := cmd.CombinedOutput()
+		if err != nil {
+			t.Fatalf("render preview: %v: %s", err, out)
+		}
+		if want == "" {
+			if !strings.Contains(string(out), "no session selected") {
+				t.Fatalf("empty preview = %q", out)
+			}
+		} else if !strings.Contains(string(out), "captured content from "+want) {
+			t.Fatalf("preview = %q; want captured content from %s", out, want)
+		}
 	}
 	key := func(s string) tea.KeyMsg { return tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune(s)} }
 
-	update(queueMsg{{ID: 1, PaneID: "%11"}, {ID: 2, PaneID: "%22"}})
+	update(queueMsg{{ID: 1, PaneID: "%11"}, {ID: 2, PaneID: "%22"}, {ID: 3, PaneID: "%33"}})
 	assertTarget("%11")
 	update(key("j"))
 	assertTarget("%22")
-	update(queueMsg{{ID: 2, PaneID: "%22"}, {ID: 1, PaneID: "%11"}})
+	update(key("k"))
+	assertTarget("%11")
+	update(key("G"))
+	assertTarget("%33")
+	update(tea.KeyMsg{Type: tea.KeyCtrlU})
+	assertTarget("%22")
+	update(tea.KeyMsg{Type: tea.KeyCtrlD})
+	assertTarget("%33")
+	update(key("g"))
+	update(key("g"))
+	assertTarget("%11")
+	update(key("j"))
+	assertTarget("%22")
+	update(tickMsg(time.Now()))
+	update(queueMsg{{ID: 2, PaneID: "%22"}, {ID: 1, PaneID: "%11"}, {ID: 3, PaneID: "%33"}})
 	assertTarget("%22") // A reorder preserves the selected queue item.
 	update(key("j"))
 	assertTarget("%11")
