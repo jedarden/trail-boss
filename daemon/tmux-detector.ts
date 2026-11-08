@@ -21,6 +21,7 @@ const QUIET_THRESHOLD_MS = parseInt(process.env.TRAILBOSS_QUIET_THRESHOLD_MS || 
 const OPT_IN_PREFIX = process.env.TRAILBOSS_OPT_IN_PREFIX || "@tb-";
 const DAEMON_URL = process.env.TRAILBOSS_DAEMON_URL || "http://127.0.0.1:4000/event/normalized";
 const TMUX_SOCKET = process.env.TRAILBOSS_TMUX_SOCKET || "";
+const EVENT_TIMEOUT_MS = Math.max(1, parseInt(process.env.TRAILBOSS_EVENT_TIMEOUT_MS || "", 10) || 5000);
 
 // ============================================================================
 // Types
@@ -228,6 +229,7 @@ async function sendEvent(event: NormalizedEvent): Promise<boolean> {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(event),
+      signal: AbortSignal.timeout(EVENT_TIMEOUT_MS),
     });
 
     if (!response.ok) {

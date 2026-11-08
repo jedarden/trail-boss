@@ -134,14 +134,14 @@ The detector should log errors but continue operating:
 | 5xx response | Log error, continue polling (event is lost) |
 | Network timeout | Log error, continue polling (event is lost) |
 
-**No retry logic** — Events are fire-and-forget. The detector's poll loop runs every 2s, so stuck state will be re-detected and re-emitted on the next cycle if needed.
+**No retry logic** — Events are fire-and-forget. The detector retains its in-memory pane state and emits again when that state changes; a failed event is not resent on the next poll.
 
 ### Fallback Behavior
 
 If the daemon is down:
 - Detector continues polling panes
 - Detector continues tracking stuck state internally
-- Events are lost, but stuck detection will recur on next poll cycle
+- Failed events are lost; later pane state changes can emit new events
 - No exponential backoff or retry queue (keep it simple)
 
 ## Testing

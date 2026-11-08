@@ -151,6 +151,7 @@ On `SIGINT` or `SIGTERM`, the detector:
 | `TRAILBOSS_QUIET_THRESHOLD_MS` | `30000` | Minimum quiet time before declaring stuck |
 | `TRAILBOSS_OPT_IN_PREFIX` | `@tb-` | Pane title prefix for opt-in monitoring |
 | `TRAILBOSS_TMUX_SOCKET` | (none) | Custom tmux socket path (for test isolation) |
+| `TRAILBOSS_EVENT_TIMEOUT_MS` | `5000` | Maximum time to wait for one event submission before logging a network error |
 
 ## Error Handling
 
@@ -159,6 +160,7 @@ The detector logs errors but continues operating:
 | Error Scenario | Log Message | Behavior |
 |----------------|-------------|----------|
 | Daemon not reachable | `[emit] Network error: ...` | Event lost, continues polling |
+| Submission timeout | `[emit] Network error: ...` | Request is aborted after the configured timeout; event lost, continues polling |
 | Invalid JSON response | `[emit] Daemon error: 400 - ...` | Event lost, continues polling |
 | tmux command fails | `[tmux] Failed to capture pane ...` | Skips pane this cycle, retries next cycle |
 | Poll cycle error | `[detector] poll error: ...` | Logs error, continues next cycle |
