@@ -398,6 +398,9 @@ function dispatchNormalizedEvent(event: NormalizedEvent): void {
   if (event.type === "unstuck") {
     const sess = getSession(event.sessionId);
     dequeue(event.sessionId);
+    if (sess) {
+      dequeueByPaneId(sess.pane_id, event.sessionId);
+    }
     console.log(`[normalized] unstuck: ${event.sessionId.slice(0, 8)}`);
     // Auto-jump if enabled and this was the operator's current pane.
     if (sess) {
@@ -420,8 +423,14 @@ function dispatchNormalizedEvent(event: NormalizedEvent): void {
     return;
   }
 
-  deleteSession(event.sessionId);
-  console.log(`[normalized] ended: ${event.sessionId.slice(0, 8)}`);
+  if (event.type === "ended") {
+    deleteSession(event.sessionId);
+    console.log(`[normalized] ended: ${event.sessionId.slice(0, 8)}`);
+    return;
+  }
+
+  const unsupported: never = event;
+  throw new Error(`Unsupported normalized event: ${JSON.stringify(unsupported)}`);
 }
 
 async function getStoredSession(sessionId: string): Promise<{ session_id: string; pane_id: string } | null> {

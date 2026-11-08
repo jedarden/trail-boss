@@ -206,6 +206,10 @@ describe("POST /event/normalized", () => {
           json: { error: "Invalid event fields" },
         });
       }
+      await expect(postEvent({ type: "paused", sessionId, timestamp: Date.now() })).resolves.toEqual({
+        status: 400,
+        json: { error: "Unknown event type" },
+      });
 
       expect(db.query("SELECT session_id FROM sessions WHERE session_id = ?").get(invalidRegisteredId)).toBeNull();
       expect(db.query("SELECT session_id FROM sessions WHERE session_id = ?").get(invalidStuckId)).toBeNull();
@@ -222,6 +226,7 @@ describe("POST /event/normalized", () => {
 
   test("dispatches all event types and keeps duplicate events idempotent", async () => {
     const sessionId = "normalized-lifecycle";
+    const db = new Database(join(dataDir, "trailboss.db"));
     const registered = {
       type: "registered",
       sessionId,
@@ -243,14 +248,37 @@ describe("POST /event/normalized", () => {
     const unstuck = { type: "unstuck", sessionId, timestamp: Date.now() };
     const ended = { type: "ended", sessionId, timestamp: Date.now() };
 
-    for (const event of [registered, registered, stuck, stuck]) {
+    for (const event of [registered, registered]) {
       await expect(postEvent(event)).resolves.toEqual({ status: 200, json: { ok: true } });
     }
+    expect(db.query("SELECT pane_id, cwd, transcript_path, last_stuck_at FROM sessions WHERE session_id = ?").get(sessionId)).toEqual({
+      pane_id: registered.paneId,
+      cwd: registered.cwd,
+      transcript_path: registered.transcriptPath,
+      last_stuck_at: null,
+    });
+    expect(db.query("SELECT COUNT(*) AS count FROM queue WHERE session_id = ?").get(sessionId)).toEqual({ count: 0 });
+
+    for (const event of [stuck, stuck]) {
+      await expect(postEvent(event)).resolves.toEqual({ status: 200, json: { ok: true } });
+    }
+    expect(db.query("SELECT last_stuck_at, last_stuck_reason, last_message FROM sessions WHERE session_id = ?").get(sessionId)).toEqual({
+      last_stuck_at: stuck.timestamp,
+      last_stuck_reason: stuck.reason,
+      last_message: stuck.message,
+    });
+    expect(db.query("SELECT stuck_at, reason, dequeued_at FROM queue WHERE session_id = ?").all(sessionId)).toEqual([
+      { stuck_at: stuck.timestamp, reason: stuck.reason, dequeued_at: null },
+    ]);
     expect((await (await fetch(`${baseUrl}/status`)).json()).stuckCount).toBe(1);
 
     for (const event of [unstuck, unstuck]) {
       await expect(postEvent(event)).resolves.toEqual({ status: 200, json: { ok: true } });
     }
+    expect(db.query("SELECT session_id FROM sessions WHERE session_id = ?").get(sessionId)).toEqual({ session_id: sessionId });
+    expect(db.query("SELECT dequeued_at FROM queue WHERE session_id = ?").all(sessionId)).toEqual([
+      { dequeued_at: expect.any(Number) },
+    ]);
     expect((await (await fetch(`${baseUrl}/status`)).json()).stuckCount).toBe(0);
 
     for (const event of [ended, ended]) {
@@ -258,8 +286,58 @@ describe("POST /event/normalized", () => {
     }
     expect((await (await fetch(`${baseUrl}/queue`)).json()).count).toBe(0);
 
-    const db = new Database(join(dataDir, "trailboss.db"));
     expect(db.query("SELECT session_id FROM sessions WHERE session_id = ?").get(sessionId)).toBeNull();
+    expect(db.query("SELECT id FROM queue WHERE session_id = ?").all(sessionId)).toEqual([]);
     db.close();
+  });
+
+  test("stuck replaces a queued synthetic pane without a foreign-key error", async () => {
+    const paneId = `%bootstrap-${crypto.randomUUID()}`;
+    const sessionId = `real-${crypto.randomUUID()}`;
+    const timestamp = Date.now();
+    const stuck = (id: string) => ({
+      type: "stuck",
+      sessionId: id,
+      paneId,
+      cwd: repoRoot,
+      transcriptPath: "",
+      reason: "stopped",
+      message: "waiting for input",
+      timestamp,
+    });
+
+    await expect(postEvent(stuck(paneId))).resolves.toEqual({ status: 200, json: { ok: true } });
+    await expect(postEvent(stuck(sessionId))).resolves.toEqual({ status: 200, json: { ok: true } });
+
+    const db = new Database(join(dataDir, "trailboss.db"));
+    expect(db.query("SELECT session_id FROM sessions WHERE session_id = ?").get(paneId)).toBeNull();
+    expect(db.query("SELECT id FROM queue WHERE session_id = ?").all(paneId)).toEqual([]);
+    expect(db.query("SELECT reason FROM queue WHERE session_id = ? AND dequeued_at IS NULL").get(sessionId)).toEqual({ reason: "stopped" });
+    db.close();
+    await expect(postEvent({ type: "ended", sessionId, timestamp })).resolves.toEqual({ status: 200, json: { ok: true } });
+  });
+
+  test("unstuck clears a queued synthetic pane and retains the registered session", async () => {
+    const paneId = `%bootstrap-${crypto.randomUUID()}`;
+    const sessionId = `real-${crypto.randomUUID()}`;
+    const timestamp = Date.now();
+    await expect(postEvent({
+      type: "stuck", sessionId: paneId, paneId, cwd: repoRoot, transcriptPath: "",
+      reason: "stopped", message: "waiting for input", timestamp,
+    })).resolves.toEqual({ status: 200, json: { ok: true } });
+    await expect(postEvent({
+      type: "registered", sessionId, paneId, cwd: repoRoot, transcriptPath: "", timestamp,
+    })).resolves.toEqual({ status: 200, json: { ok: true } });
+    await expect(postEvent({ type: "unstuck", sessionId, timestamp })).resolves.toEqual({
+      status: 200, json: { ok: true },
+    });
+
+    const db = new Database(join(dataDir, "trailboss.db"));
+    expect(db.query("SELECT session_id FROM sessions WHERE session_id = ?").get(paneId)).toBeNull();
+    expect(db.query("SELECT id FROM queue WHERE session_id = ?").all(paneId)).toEqual([]);
+    expect(db.query("SELECT pane_id FROM sessions WHERE session_id = ?").get(sessionId)).toEqual({ pane_id: paneId });
+    expect((await (await fetch(`${baseUrl}/status`)).json()).stuckCount).toBe(0);
+    db.close();
+    await expect(postEvent({ type: "ended", sessionId, timestamp })).resolves.toEqual({ status: 200, json: { ok: true } });
   });
 });

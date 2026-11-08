@@ -85,19 +85,14 @@ export function dequeue(sessionId: string): void {
   stmt.run(now, sessionId);
 }
 
-// Dequeue any synthetic bootstrap entry whose session_id equals the pane_id
-// (but skip if it's already the real session). Called when a real hook fires for a pane.
+// Remove any synthetic bootstrap entry whose session_id equals the pane_id
+// (but skip if it's already the real session). Called when a real event fires for a pane.
 export function dequeueByPaneId(paneId: string, realSessionId: string): void {
-  const now = Date.now();
-  // Bootstrap entries have session_id = pane_id
-  const stmt = db.prepare(`
-    UPDATE queue SET dequeued_at = ?
-    WHERE session_id = ? AND session_id != ? AND dequeued_at IS NULL
-  `);
-  stmt.run(now, paneId, realSessionId);
-  // Also clean up the synthetic session row itself
-  const del = db.prepare(`DELETE FROM sessions WHERE session_id = ? AND session_id != ?`);
-  del.run(paneId, realSessionId);
+  // Bootstrap entries have session_id = pane_id. Remove their queue history
+  // before deleting the session, since queue.session_id is a foreign key.
+  if (paneId !== realSessionId) {
+    deleteSession(paneId);
+  }
 }
 
 export function skipHead(sessionId: string, cooldownMs: number): void {
