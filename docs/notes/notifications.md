@@ -66,6 +66,17 @@ If the proxy is not running, notifications will fail gracefully (logged to stder
 
 ## Testing
 
+The threshold / cooldown / head-dedup / proxy-down behaviors are covered by
+an automated acceptance test that runs a mock telegram proxy over HTTP and a
+controlled clock:
+
+```bash
+bun test daemon/notify.test.ts   # part of `bun test` (scripts/definition-of-done.sh)
+```
+
+An end-to-end variant against a live daemon is in `test-notification.sh`.
+Manual checks:
+
 ```bash
 # Manually trigger a notification check
 curl -s http://localhost:4000/status | jq '.stuckCount'

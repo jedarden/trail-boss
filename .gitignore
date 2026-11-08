@@ -36,3 +36,6 @@ bin/trailboss-tui
 
 # Generated verification output
 test-results/
+
+# vitest/bun test caches (e.g. node_modules/.vitest-cache)
+node_modules/

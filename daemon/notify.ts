@@ -68,6 +68,11 @@ async function sendTelegramNotification(message: string): Promise<boolean> {
 
 /**
  * Check if notification should be sent (rate limiting + deduplication)
+ *
+ * The cooldown is per head item: a new session reaching the head resets it
+ * (docs/notes/notifications.md, "Cooldown per head item"), so a changed head
+ * re-alerts immediately while the same head is suppressed for the cooldown
+ * window and de-duplicated entirely while its queue count is unchanged.
  */
 function shouldNotify(currentCount: number, headSessionId: string): boolean {
   const now = Date.now();
@@ -77,14 +82,16 @@ function shouldNotify(currentCount: number, headSessionId: string): boolean {
     return false;
   }
 
-  // Check cooldown period
-  if (notifyState.lastNotifiedAt && (now - notifyState.lastNotifiedAt) < NOTIFY_COOLDOWN_MS) {
+  const sameHead = notifyState.lastNotifiedSessionId === headSessionId;
+
+  // Check cooldown period (only while the notified item is still the head)
+  if (sameHead && notifyState.lastNotifiedAt && (now - notifyState.lastNotifiedAt) < NOTIFY_COOLDOWN_MS) {
     console.log(`[notify] in cooldown period (${Math.round((now - notifyState.lastNotifiedAt) / 1000)}s ago)`);
     return false;
   }
 
   // Check if this is a new head item (deduplication)
-  if (notifyState.lastNotifiedSessionId === headSessionId && notifyState.lastNotifiedCount === currentCount) {
+  if (sameHead && notifyState.lastNotifiedCount === currentCount) {
     console.log("[notify] already notified for this head item and count");
     return false;
   }
