@@ -5,5 +5,5 @@ gates:
   - type: command
     run_in: clean
     commands:
-      - bun test
+      - scripts/definition-of-done.sh --fast
       - bash test-starvation-classification.sh
