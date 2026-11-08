@@ -10,7 +10,7 @@
  * Usage: bun run daemon/tmux-detector.ts
  */
 
-import { execSync } from "node:child_process";
+import { execFileSync } from "node:child_process";
 
 // ============================================================================
 // Configuration
@@ -88,13 +88,14 @@ function log(message: string): void {
 // ============================================================================
 
 /**
- * Get the tmux command with custom socket if specified
+ * Run tmux without a shell so a custom socket path is passed as one argument.
+ * This keeps acceptance runs isolated even when the path contains spaces.
  */
-function getTmuxCmd(): string {
-  if (TMUX_SOCKET) {
-    return `tmux -S ${TMUX_SOCKET}`;
-  }
-  return "tmux";
+function runTmux(args: string[]): string {
+  const socketArgs = TMUX_SOCKET ? ["-S", TMUX_SOCKET] : [];
+  return execFileSync("tmux", [...socketArgs, ...args], {
+    stdio: ["ignore", "pipe", "ignore"],
+  }).toString();
 }
 
 /**
@@ -104,11 +105,7 @@ function discoverOptedInPanes(): Set<string> {
   const result = new Set<string>();
 
   try {
-    const tmuxCmd = getTmuxCmd();
-    const cmd = `${tmuxCmd} list-panes -a -F '#{pane_id} #{pane_title}'`;
-    const output = execSync(cmd, { stdio: ["ignore", "pipe", "ignore"] })
-      .toString()
-      .trim();
+    const output = runTmux(["list-panes", "-a", "-F", "#{pane_id} #{pane_title}"]).trim();
     const lines = output.split("\n");
 
     for (const line of lines) {
@@ -135,11 +132,7 @@ function discoverOptedInPanes(): Set<string> {
  */
 function capturePane(paneId: string): string {
   try {
-    const tmuxCmd = getTmuxCmd();
-    const cmd = `${tmuxCmd} capture-pane -p -t ${paneId}`;
-    return execSync(cmd, { stdio: ["ignore", "pipe", "ignore"] })
-      .toString()
-      .trim();
+    return runTmux(["capture-pane", "-p", "-t", paneId]).trim();
   } catch (err) {
     log(`[tmux] Failed to capture pane ${paneId}: ${err}`);
     return "";
@@ -151,11 +144,7 @@ function capturePane(paneId: string): string {
  */
 function paneExists(paneId: string): boolean {
   try {
-    const tmuxCmd = getTmuxCmd();
-    const cmd = `${tmuxCmd} display -p -t ${paneId} '#{pane_id}'`;
-    const output = execSync(cmd, { stdio: ["ignore", "pipe", "ignore"] })
-      .toString()
-      .trim();
+    const output = runTmux(["display", "-p", "-t", paneId, "#{pane_id}"]).trim();
     return output === paneId;
   } catch {
     return false;
@@ -167,11 +156,7 @@ function paneExists(paneId: string): boolean {
  */
 function getPaneCwd(paneId: string): string {
   try {
-    const tmuxCmd = getTmuxCmd();
-    const cmd = `${tmuxCmd} display -p -t ${paneId} '#{pane_current_path}'`;
-    return execSync(cmd, { stdio: ["ignore", "pipe", "ignore"] })
-      .toString()
-      .trim();
+    return runTmux(["display", "-p", "-t", paneId, "#{pane_current_path}"]).trim();
   } catch {
     return "";
   }
@@ -459,6 +444,7 @@ async function main(): Promise<void> {
   log("[detector] Trail Boss Tmux Detector Poller starting...");
   log(`[detector] daemon URL: ${DAEMON_URL}`);
   log(`[detector] opt-in prefix: ${OPT_IN_PREFIX}`);
+  log(`[detector] tmux socket: ${TMUX_SOCKET || "default"}`);
 
   await pollLoop();
 }

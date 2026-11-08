@@ -113,6 +113,9 @@ for run in $(seq 1 $NUM_RUNS); do
     elif grep -q "detector failed to start" "$log_file" 2>/dev/null; then
       failure_type="detector_start"
       error_message="Infrastructure: detector failed to start"
+    elif grep -q "Failed to list panes" "$log_file" 2>/dev/null; then
+      failure_type="tmux_list_failure"
+      error_message="Infrastructure: detector could not access the isolated tmux server"
     elif grep -q "Failed to set pane title" "$log_file" 2>/dev/null; then
       failure_type="pane_title"
       error_message="Infrastructure: tmux pane configuration failed"

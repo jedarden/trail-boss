@@ -20,7 +20,7 @@ async function waitFor(description: string, condition: () => boolean, logs: () =
 
 async function runFailureScenario(failure: Failure): Promise<void> {
   await mkdir(testRoot, { recursive: true });
-  const dir = await mkdtemp(join(testRoot, "tmux-detector-"));
+  const dir = await mkdtemp(join(testRoot, "tmux detector-"));
   const socket = join(dir, "tmux.sock");
   const tmux = (...args: string[]) => execFileSync("tmux", ["-S", socket, ...args], { encoding: "utf8" }).trim();
   const received: Event[] = [];
@@ -54,10 +54,11 @@ async function runFailureScenario(failure: Failure): Promise<void> {
     tmux("select-pane", "-t", "submission-test", "-T", "@tb-submission-test");
     const paneId = tmux("display", "-p", "-t", "submission-test", "#{pane_id}");
 
+    const { TMUX: _tmux, ...envWithoutTmux } = process.env;
     detector = spawn(process.execPath, ["run", "daemon/tmux-detector.ts"], {
       cwd: repoRoot,
       env: {
-        ...process.env,
+        ...envWithoutTmux,
         TRAILBOSS_TMUX_SOCKET: socket,
         TRAILBOSS_DAEMON_URL: `http://127.0.0.1:${port}/event/normalized`,
         TRAILBOSS_POLL_INTERVAL_MS: "50",

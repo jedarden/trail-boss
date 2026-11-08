@@ -420,9 +420,9 @@ The test creates an isolated tmux server with a custom socket (`-L /tmp/tmux-tes
 1. **For production deployment**: The detector is ready. Core functionality works correctly and reliably.
 
 2. **For test infrastructure**: Fix the multi-server isolation issue by:
-   - Set `TMUX=/path/to/custom/tmux` environment variable when running the detector in tests
-   - Use `tmux -S /tmp/tmux-test-* -L test-server` for BOTH the test server AND the detector
-   - Ensure the detector's tmux command points to the isolated socket
+   - Set `TRAILBOSS_TMUX_SOCKET=/path/to/custom/socket` when running the detector in tests
+   - Run both the test commands and detector with the same explicit `tmux -S /tmp/tmux-test-*` socket
+   - Clear inherited `TMUX` when launching the detector so the caller's server cannot override test isolation
    - Or: clear all opted-in panes from the main tmux server before running tests
 
 3. **For monitoring**: Add detector-specific metrics:

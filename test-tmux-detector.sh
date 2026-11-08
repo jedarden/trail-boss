@@ -17,16 +17,22 @@
 set -e
 
 TB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-DAEMON_PORT="${TRAILBOSS_TEST_PORT:-4000}"
-DAEMON_URL="http://127.0.0.1:$DAEMON_PORT"
-
 # Add bun to PATH
 export PATH="$HOME/.bun/bin:$PATH"
+
+find_free_port() {
+  bun -e 'const server = Bun.serve({ hostname: "127.0.0.1", port: 0, fetch() { return new Response(); } }); console.log(server.port); server.stop();'
+}
+
+DAEMON_PORT="${TRAILBOSS_TEST_PORT:-$(find_free_port)}"
+DAEMON_URL="http://127.0.0.1:$DAEMON_PORT"
 DATA_DIR="${TRAILBOSS_TEST_DATA_DIR:-/tmp/trailboss-detector-data-$$}"
 
-# Isolated tmux socket — never touches the user's main server
-TMUX_TEST_SOCK="/tmp/tmux-trailboss-detector-$$"
-TMUX="tmux -S $TMUX_TEST_SOCK"
+# Isolated tmux socket — never touches the user's main server. Use a unique
+# directory so an interrupted run cannot leave a socket that a later run
+# accidentally reuses.
+TMUX_TEST_DIR="$(mktemp -d "${TMPDIR:-/tmp}/trailboss-detector-tmux.XXXXXX")"
+TMUX_TEST_SOCK="$TMUX_TEST_DIR/server"
 DAEMON_PID=""
 DETECTOR_PID=""
 
@@ -35,6 +41,12 @@ export TRAILBOSS_POLL_INTERVAL_MS=500   # Check every 0.5s
 export TRAILBOSS_QUIET_THRESHOLD_MS=3000 # 3s quiet = stuck
 export TRAILBOSS_DAEMON_URL="$DAEMON_URL/event/normalized"
 export TRAILBOSS_OPT_IN_PREFIX="@tb-test-"
+
+# Do not let the caller's tmux client context select a different server. The
+# test commands and detector both receive the private socket explicitly.
+tmux_test() {
+  env -u TMUX tmux -S "$TMUX_TEST_SOCK" "$@"
+}
 
 # Cleanup function
 cleanup() {
@@ -45,13 +57,13 @@ cleanup() {
   if [ -n "$DAEMON_PID" ]; then kill "$DAEMON_PID" 2>/dev/null || true; fi
 
   # Kill test tmux server
-  $TMUX kill-server 2>/dev/null || true
+  tmux_test kill-server 2>/dev/null || true
 
   # Clean up data dir
   rm -rf "$DATA_DIR" 2>/dev/null || true
 
-  # Remove socket file
-  rm -f "$TMUX_TEST_SOCK" 2>/dev/null || true
+  # Remove the private socket directory
+  rm -rf "$TMUX_TEST_DIR" 2>/dev/null || true
 }
 trap cleanup EXIT
 
@@ -67,12 +79,17 @@ sleep 1
 echo "[setup] Starting daemon..."
 mkdir -p "$DATA_DIR"
 cd "$TB_DIR/daemon"
-TRAILBOSS_PORT="$DAEMON_PORT" TRAILBOSS_DATA_DIR="$DATA_DIR" bun index.ts > /tmp/tb-daemon-log-$$ 2>&1 &
+env -u TMUX TRAILBOSS_PORT="$DAEMON_PORT" TRAILBOSS_DATA_DIR="$DATA_DIR" bun index.ts > /tmp/tb-daemon-log-$$ 2>&1 &
 DAEMON_PID=$!
-sleep 2
+for _ in $(seq 1 20); do
+  if kill -0 "$DAEMON_PID" 2>/dev/null && curl -sf --max-time 1 "$DAEMON_URL/status" >/dev/null 2>&1; then
+    break
+  fi
+  sleep 0.1
+done
 
 # Verify daemon started
-if ! curl -s --max-time 1 "$DAEMON_URL/status" >/dev/null 2>&1; then
+if ! kill -0 "$DAEMON_PID" 2>/dev/null || ! curl -sf --max-time 1 "$DAEMON_URL/status" >/dev/null 2>&1; then
   echo "[error] daemon failed to start"
   cat /tmp/tb-daemon-log-$$
   exit 1
@@ -80,7 +97,8 @@ fi
 echo "[setup] daemon running (PID $DAEMON_PID)"
 
 # Start a fresh tmux server for testing
-$TMUX start-server 2>/dev/null || true
+mkdir -p "$TMUX_TEST_DIR"
+tmux_test start-server 2>/dev/null || true
 
 # Helper: create a test pane with @tb- prefix
 create_test_pane() {
@@ -88,10 +106,10 @@ create_test_pane() {
   local title=$2
   # Create session with a shell that will show a prompt and then wait
   # Use bash with a command that ends, leaving us at a prompt
-  $TMUX new-session -d -s "$name" "bash -c 'echo ready; bash'"
+  tmux_test new-session -d -s "$name" "bash -c 'echo ready; bash'"
   # Set the pane title (not window name) - this is what the detector checks
-  $TMUX select-pane -t "$name" -T "$title"
-  local pane_id=$($TMUX display -p -t "$name" '#{pane_id}')
+  tmux_test select-pane -t "$name" -T "$title"
+  local pane_id=$(tmux_test display -p -t "$name" '#{pane_id}')
   echo "$pane_id"
 }
 
@@ -133,7 +151,7 @@ TRAILBOSS_QUIET_THRESHOLD_MS=3000 \
 TRAILBOSS_DAEMON_URL="$DAEMON_URL/event/normalized" \
 TRAILBOSS_OPT_IN_PREFIX="@tb-test-" \
 TRAILBOSS_TMUX_SOCKET="$TMUX_TEST_SOCK" \
-bun tmux-detector.ts > /tmp/tb-detector-log-$$ 2>&1 &
+env -u TMUX bun tmux-detector.ts > /tmp/tb-detector-log-$$ 2>&1 &
 DETECTOR_PID=$!
 echo "[step 2] detector running (PID $DETECTOR_PID)"
 
@@ -215,7 +233,7 @@ echo "[step 5] Simulating user activity (typing into pane)..."
 
 # Send some input to the pane to change its output
 # Run a loop that keeps outputting so the pane doesn't go quiet again
-$TMUX send-keys -t "$TEST_PANE_ID" "while true; do echo 'activity'; sleep 0.5; done" Enter
+tmux_test send-keys -t "$TEST_PANE_ID" "while true; do echo 'activity'; sleep 0.5; done" Enter
 sleep 1
 
 # ============================================================================
@@ -252,7 +270,7 @@ echo "[step 6] session $SESSION_ID removed from queue ✓"
 # ============================================================================
 echo ""
 echo "[step 7] Ending the tmux pane and verifying session cleanup..."
-$TMUX kill-session -t "test-session"
+tmux_test kill-session -t "test-session"
 sleep 2
 
 if ! grep -q "untracked pane" /tmp/tb-detector-log-$$; then

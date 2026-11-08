@@ -93,6 +93,8 @@ for run in $(seq 1 $NUM_RUNS); do
       notes="Infrastructure: daemon failed to start"
     elif grep -q "detector failed to start" "$log_file" 2>/dev/null; then
       notes="Infrastructure: detector failed to start"
+    elif grep -q "Failed to list panes" "$log_file" 2>/dev/null; then
+      notes="Infrastructure: detector could not access the isolated tmux server"
     elif grep -q "Failed to set pane title" "$log_file" 2>/dev/null; then
       notes="Infrastructure: tmux pane configuration failed"
     elif grep -q "Queue should be empty" "$log_file" 2>/dev/null; then
