@@ -8,12 +8,15 @@ import (
 )
 
 func main() {
+	_ = WritePreviewTarget("")
 	m := NewModel()
 	p := tea.NewProgram(m,
 		tea.WithAltScreen(),
 		tea.WithMouseCellMotion(),
 	)
-	if _, err := p.Run(); err != nil {
+	_, err := p.Run()
+	_ = WritePreviewTarget("")
+	if err != nil {
 		fmt.Fprintln(os.Stderr, "error:", err)
 		os.Exit(1)
 	}

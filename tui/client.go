@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"time"
 )
@@ -29,9 +30,16 @@ type QueueItem struct {
 	PaneID            string  `json:"pane_id"`
 	CWD               string  `json:"cwd"`
 	Reason            string  `json:"reason"`
-	LastMessage       *string `json:"last_message"` // nullable
-	StuckAt           int64   `json:"stuck_at"`     // epoch ms
+	LastMessage       *string `json:"last_message"`        // nullable
+	StuckAt           int64   `json:"stuck_at"`            // epoch ms
 	SkipCooldownUntil *int64  `json:"skip_cooldown_until"` // nullable, epoch ms
+}
+
+func (item QueueItem) message() string {
+	if item.LastMessage == nil {
+		return ""
+	}
+	return *item.LastMessage
 }
 
 // QueueResponse is the /queue endpoint response.
@@ -43,8 +51,8 @@ type QueueResponse struct {
 // StatusResponse is the /status endpoint response.
 // Matches daemon: { "status": "ok", "stuckCount": N }
 type StatusResponse struct {
-	Status    string `json:"status"`
-	StuckCount int   `json:"stuckCount"`
+	Status     string `json:"status"`
+	StuckCount int    `json:"stuckCount"`
 }
 
 // NextResponse is the /next and /skip endpoint response.
@@ -136,10 +144,25 @@ func GetPaneSessionMap() map[string]string {
 	return m
 }
 
-// WritePreviewTarget writes paneID to /tmp/trailboss-preview-target so the
-// preview pane below the TUI mirrors that session.
-func WritePreviewTarget(paneID string) {
-	_ = os.WriteFile("/tmp/trailboss-preview-target", []byte(paneID), 0644)
+// WritePreviewTarget atomically publishes the selected pane for the preview loop.
+func WritePreviewTarget(paneID string) error {
+	path := os.Getenv("TRAILBOSS_PREVIEW_TARGET_FILE")
+	if path == "" {
+		path = "/tmp/trailboss-preview-target"
+	}
+	tmp, err := os.CreateTemp(filepath.Dir(path), ".trailboss-preview-*")
+	if err != nil {
+		return err
+	}
+	defer os.Remove(tmp.Name())
+	if _, err := tmp.WriteString(paneID); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	return os.Rename(tmp.Name(), path)
 }
 
 // JumpToPane switches the tmux client to the given pane, recording the origin.

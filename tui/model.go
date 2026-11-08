@@ -154,8 +154,21 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.daemonOK = true
 		m.err = nil
 		oldLen := len(m.queue)
+		selectedID := 0
+		if m.cursor >= 0 && m.cursor < oldLen {
+			selectedID = m.queue[m.cursor].ID
+		}
 		m.queue = msg
-		// Clamp cursor.
+		// Keep the selected item when a poll reorders the queue.
+		if selectedID != 0 {
+			for i, item := range m.queue {
+				if item.ID == selectedID {
+					m.cursor = i
+					break
+				}
+			}
+		}
+		// Clamp cursor when the selected item has left the queue.
 		if m.cursor >= len(m.queue) {
 			m.cursor = max(0, len(m.queue)-1)
 		}
@@ -250,6 +263,9 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 
 	case "ctrl+d":
+		if n == 0 {
+			break
+		}
 		half := max(1, m.contentHeight()/2)
 		m.cursor = min(n-1, m.cursor+half)
 		m.detailScroll = 0
@@ -352,20 +368,6 @@ func (m Model) statusBarView() string {
 
 	parts = append(parts, fmt.Sprintf("queue: %d", len(m.queue)))
 
-	if m.daemonOK {
-		ago := m.status.LastReconcileAgoS
-		if ago < 0 {
-			ago = 0
-		}
-		parts = append(parts, fmt.Sprintf("reconcile: %.0fs ago", ago))
-
-		if m.status.SkipCooldownS > 0 {
-			parts = append(parts, fmt.Sprintf("skip cooldown: %.0fs", m.status.SkipCooldownS))
-		} else {
-			parts = append(parts, "skip cooldown: —")
-		}
-	}
-
 	content := strings.Join(parts, "   ")
 	return m.theme.StatusBar.Width(m.width).Render(content)
 }
@@ -387,8 +389,8 @@ func (m Model) splitView(height int) string {
 
 	// Draw vertical divider.
 	divider := lipgloss.NewStyle().
-		Foreground(m.theme.BorderColor).
-		Render(strings.Repeat("│\n", height-1)+"│")
+		Foreground(m.theme.PanelBorder.GetForeground()).
+		Render(strings.Repeat("│\n", height-1) + "│")
 
 	return lipgloss.JoinHorizontal(lipgloss.Top, listContent, divider, detailContent)
 }
@@ -441,7 +443,7 @@ func (m Model) listView(width, height int) string {
 		lines = append(lines, emptyMsg)
 	}
 
-	for i, item := range m.queue.Items {
+	for i, item := range m.queue {
 		// Determine session label.
 		sessLabel := m.paneMap[item.PaneID]
 		if sessLabel == "" {
@@ -542,7 +544,7 @@ func (m Model) detailPaneView(width, height int) string {
 	if innerWidth < 10 {
 		innerWidth = 10
 	}
-	wrapped := wordWrap(item.LastMessage, innerWidth)
+	wrapped := wordWrap(item.message(), innerWidth)
 
 	// Update the viewport with the latest content, then render it.
 	m.detail.Width = width
@@ -596,7 +598,7 @@ func (m Model) detailContent() string {
 	if innerWidth < 10 {
 		innerWidth = 10
 	}
-	wrapped := wordWrap(item.LastMessage, innerWidth)
+	wrapped := wordWrap(item.message(), innerWidth)
 	return wrapped
 }
 
@@ -628,7 +630,7 @@ func (m Model) helpView() string {
 `
 	boxStyle := lipgloss.NewStyle().
 		BorderStyle(lipgloss.RoundedBorder()).
-		BorderForeground(m.theme.BorderColor).
+		BorderForeground(m.theme.PanelBorder.GetForeground()).
 		Padding(1, 2)
 
 	box := boxStyle.Render(strings.TrimLeft(help, "\n"))
@@ -640,7 +642,7 @@ func (m Model) helpView() string {
 // syncPreview writes the currently-selected pane_id to the preview target file
 // so the trailboss-preview pane below mirrors the right session.
 func (m Model) syncPreview() {
-	if len(m.queue) > 0 && m.cursor < len(m.queue) {
+	if m.cursor >= 0 && m.cursor < len(m.queue) {
 		WritePreviewTarget(m.queue[m.cursor].PaneID)
 	} else {
 		WritePreviewTarget("")
