@@ -26,7 +26,7 @@ async function waitForDaemon(): Promise<void> {
   throw new Error("normalized-event test daemon did not start");
 }
 
-async function postNormalized(body: string): Promise<{ status: number; json: Record<string, unknown> }> {
+async function postNormalized(body: string): Promise<EndpointResponse> {
   const response = await fetch(`${baseUrl}/event/normalized`, {
     method: "POST",
     headers: { "content-type": "application/json" },
@@ -35,8 +35,29 @@ async function postNormalized(body: string): Promise<{ status: number; json: Rec
   return { status: response.status, json: await response.json() as Record<string, unknown> };
 }
 
-async function postEvent(event: Record<string, unknown>): Promise<{ status: number; json: Record<string, unknown> }> {
+async function postEvent(event: Record<string, unknown>): Promise<EndpointResponse> {
   return postNormalized(JSON.stringify(event));
+}
+
+type EndpointResponse = { status: number; json: Record<string, unknown> };
+
+// A failure must identify the request that produced it and the response contract
+// it violated, so every HTTP assertion embeds the endpoint and the exact request
+// body in its failure message (bun prints the expect() message above the diff).
+function expectResponse(
+  request: Promise<EndpointResponse>,
+  expected: EndpointResponse,
+  requestLabel: string,
+): Promise<void> {
+  return expect(request, requestLabel).resolves.toEqual(expected);
+}
+
+function expectNormalized(event: Record<string, unknown>, expected: EndpointResponse): Promise<void> {
+  return expectResponse(postEvent(event), expected, `POST /event/normalized body=${JSON.stringify(event)}`);
+}
+
+function expectNormalizedBody(body: string, expected: EndpointResponse): Promise<void> {
+  return expectResponse(postNormalized(body), expected, `POST /event/normalized body=${body}`);
 }
 
 beforeAll(async () => {
@@ -68,32 +89,27 @@ afterAll(async () => {
 
 describe("POST /event/normalized", () => {
   test("rejects malformed JSON and missing or unknown types", async () => {
-    const malformedResponses = await Promise.all([
-      postNormalized("{"),
-      postNormalized("{"),
-      postNormalized("not-json"),
-    ]);
-    expect(malformedResponses).toEqual([
-      { status: 400, json: { error: "Invalid JSON" } },
-      { status: 400, json: { error: "Invalid JSON" } },
-      { status: 400, json: { error: "Invalid JSON" } },
-    ]);
-    const invalidTypeResponses = await Promise.all([
-      postNormalized("null"),
-      postNormalized("[]"),
-      postEvent({ sessionId: "missing-type" }),
-      postEvent({ type: "" }),
-      postEvent({ type: 42 }),
-      postEvent({ type: null }),
-    ]);
-    expect(invalidTypeResponses).toEqual(invalidTypeResponses.map(() => ({
-      status: 400,
-      json: { error: "Invalid or missing event type" },
-    })));
-    await expect(postEvent({ type: "paused" })).resolves.toEqual({
-      status: 400,
-      json: { error: "Unknown event type" },
-    });
+    for (const body of ["", "{", "not-json"]) {
+      await expectNormalizedBody(body, { status: 400, json: { error: "Invalid JSON" } });
+    }
+    for (const body of ["null", "[]"]) {
+      await expectNormalizedBody(body, { status: 400, json: { error: "Invalid or missing event type" } });
+    }
+    for (const event of [
+      {},
+      { sessionId: "missing-type" },
+      { type: "" },
+      { type: 42 },
+      { type: null },
+    ]) {
+      await expectNormalized(event, { status: 400, json: { error: "Invalid or missing event type" } });
+    }
+    for (const type of ["paused", "Stuck"]) {
+      await expectNormalized({ type, sessionId: "unknown-type", timestamp: Date.now() }, {
+        status: 400,
+        json: { error: "Unknown event type" },
+      });
+    }
   });
 
   test("rejects missing required fields and invalid values for every event type", async () => {
@@ -155,12 +171,9 @@ describe("POST /event/normalized", () => {
     ];
 
     for (const event of [...missingFieldEvents, ...invalidValueEvents]) {
-      await expect(postEvent(event)).resolves.toEqual({
-        status: 400,
-        json: { error: "Invalid event fields" },
-      });
+      await expectNormalized(event, { status: 400, json: { error: "Invalid event fields" } });
     }
-    await expect(postNormalized('{"type":"ended","sessionId":"overflow","timestamp":1e400}')).resolves.toEqual({
+    await expectNormalizedBody('{"type":"ended","sessionId":"overflow","timestamp":1e400}', {
       status: 400,
       json: { error: "Invalid event fields" },
     });
@@ -191,8 +204,8 @@ describe("POST /event/normalized", () => {
         message: "waiting for input",
         timestamp: Date.now(),
       };
-      await expect(postEvent(registered)).resolves.toEqual({ status: 200, json: { ok: true } });
-      await expect(postEvent(stuck)).resolves.toEqual({ status: 200, json: { ok: true } });
+      await expectNormalized(registered, { status: 200, json: { ok: true } });
+      await expectNormalized(stuck, { status: 200, json: { ok: true } });
 
       const invalidEvents = [
         { ...registered, sessionId: invalidRegisteredId, paneId: "" },
@@ -201,12 +214,9 @@ describe("POST /event/normalized", () => {
         { type: "ended", sessionId, timestamp: 0 },
       ];
       for (const event of invalidEvents) {
-        await expect(postEvent(event)).resolves.toEqual({
-          status: 400,
-          json: { error: "Invalid event fields" },
-        });
+        await expectNormalized(event, { status: 400, json: { error: "Invalid event fields" } });
       }
-      await expect(postEvent({ type: "paused", sessionId, timestamp: Date.now() })).resolves.toEqual({
+      await expectNormalized({ type: "paused", sessionId, timestamp: Date.now() }, {
         status: 400,
         json: { error: "Unknown event type" },
       });
@@ -249,7 +259,7 @@ describe("POST /event/normalized", () => {
     const ended = { type: "ended", sessionId, timestamp: Date.now() };
 
     for (const event of [registered, registered]) {
-      await expect(postEvent(event)).resolves.toEqual({ status: 200, json: { ok: true } });
+      await expectNormalized(event, { status: 200, json: { ok: true } });
     }
     expect(db.query("SELECT pane_id, cwd, transcript_path, last_stuck_at FROM sessions WHERE session_id = ?").get(sessionId)).toEqual({
       pane_id: registered.paneId,
@@ -260,7 +270,7 @@ describe("POST /event/normalized", () => {
     expect(db.query("SELECT COUNT(*) AS count FROM queue WHERE session_id = ?").get(sessionId)).toEqual({ count: 0 });
 
     for (const event of [stuck, stuck]) {
-      await expect(postEvent(event)).resolves.toEqual({ status: 200, json: { ok: true } });
+      await expectNormalized(event, { status: 200, json: { ok: true } });
     }
     expect(db.query("SELECT last_stuck_at, last_stuck_reason, last_message FROM sessions WHERE session_id = ?").get(sessionId)).toEqual({
       last_stuck_at: stuck.timestamp,
@@ -273,7 +283,7 @@ describe("POST /event/normalized", () => {
     expect((await (await fetch(`${baseUrl}/status`)).json()).stuckCount).toBe(1);
 
     for (const event of [unstuck, unstuck]) {
-      await expect(postEvent(event)).resolves.toEqual({ status: 200, json: { ok: true } });
+      await expectNormalized(event, { status: 200, json: { ok: true } });
     }
     expect(db.query("SELECT session_id FROM sessions WHERE session_id = ?").get(sessionId)).toEqual({ session_id: sessionId });
     expect(db.query("SELECT dequeued_at FROM queue WHERE session_id = ?").all(sessionId)).toEqual([
@@ -282,7 +292,7 @@ describe("POST /event/normalized", () => {
     expect((await (await fetch(`${baseUrl}/status`)).json()).stuckCount).toBe(0);
 
     for (const event of [ended, ended]) {
-      await expect(postEvent(event)).resolves.toEqual({ status: 200, json: { ok: true } });
+      await expectNormalized(event, { status: 200, json: { ok: true } });
     }
     expect((await (await fetch(`${baseUrl}/queue`)).json()).count).toBe(0);
 
@@ -307,12 +317,12 @@ describe("POST /event/normalized", () => {
       db.query("SELECT COUNT(*) AS count FROM queue WHERE session_id = ? AND dequeued_at IS NULL").get(sessionId) as { count: number };
 
     try {
-      await expect(postEvent(registered)).resolves.toEqual({ status: 200, json: { ok: true } });
-      await expect(postEvent(stuck(t0 + 1000))).resolves.toEqual({ status: 200, json: { ok: true } });
+      await expectNormalized(registered, { status: 200, json: { ok: true } });
+      await expectNormalized(stuck(t0 + 1000), { status: 200, json: { ok: true } });
       expect(liveQueueRows().count).toBe(1);
 
       // Session progresses past the stuck event...
-      await expect(postEvent({ type: "unstuck", sessionId, timestamp: t0 + 2000 })).resolves.toEqual({
+      await expectNormalized({ type: "unstuck", sessionId, timestamp: t0 + 2000 }, {
         status: 200, json: { ok: true },
       });
       expect(
@@ -322,14 +332,14 @@ describe("POST /event/normalized", () => {
 
       // ...so the retried stuck event (same producer timestamp) is a no-op that
       // still returns the documented success response.
-      await expect(postEvent(stuck(t0 + 1000))).resolves.toEqual({ status: 200, json: { ok: true } });
+      await expectNormalized(stuck(t0 + 1000), { status: 200, json: { ok: true } });
       expect(liveQueueRows().count).toBe(0);
       expect(
         db.query("SELECT last_stuck_at, last_stuck_reason, last_message FROM sessions WHERE session_id = ?").get(sessionId)
       ).toEqual({ last_stuck_at: t0 + 1000, last_stuck_reason: "stopped", last_message: "waiting for input" });
 
       // A genuinely newer stuck event is not suppressed.
-      await expect(postEvent(stuck(t0 + 3000))).resolves.toEqual({ status: 200, json: { ok: true } });
+      await expectNormalized(stuck(t0 + 3000), { status: 200, json: { ok: true } });
       expect(liveQueueRows().count).toBe(1);
       expect(
         db.query("SELECT stuck_at FROM queue WHERE session_id = ? AND dequeued_at IS NULL").get(sessionId)
@@ -355,9 +365,9 @@ describe("POST /event/normalized", () => {
     const db = new Database(join(dataDir, "trailboss.db"));
 
     try {
-      await expect(postEvent(registered)).resolves.toEqual({ status: 200, json: { ok: true } });
-      await expect(postEvent(stuck)).resolves.toEqual({ status: 200, json: { ok: true } });
-      await expect(postEvent({ type: "ended", sessionId, timestamp: endedTs })).resolves.toEqual({
+      await expectNormalized(registered, { status: 200, json: { ok: true } });
+      await expectNormalized(stuck, { status: 200, json: { ok: true } });
+      await expectNormalized({ type: "ended", sessionId, timestamp: endedTs }, {
         status: 200, json: { ok: true },
       });
       expect(db.query("SELECT session_id FROM sessions WHERE session_id = ?").get(sessionId)).toBeNull();
@@ -371,7 +381,7 @@ describe("POST /event/normalized", () => {
         { label: "unstuck", event: { type: "unstuck", sessionId, timestamp: t0 + 1500 } },
       ] as const;
       for (const { label, event } of retries) {
-        await expect(postEvent(event)).resolves.toEqual({ status: 200, json: { ok: true } });
+        await expectNormalized(event, { status: 200, json: { ok: true } });
         expect(db.query("SELECT session_id FROM sessions WHERE session_id = ?").get(sessionId)).toBeNull();
         expect(db.query("SELECT id FROM queue WHERE session_id = ?").all(sessionId)).toEqual([]);
         expect(db.query("SELECT COUNT(*) AS count FROM ended_sessions WHERE session_id = ?").get(sessionId))
@@ -381,7 +391,7 @@ describe("POST /event/normalized", () => {
 
       // Boundary: a registration newer than the tombstone is a fresh event,
       // not a retry, and is accepted.
-      await expect(postEvent({ ...registered, timestamp: endedTs + 1000 })).resolves.toEqual({
+      await expectNormalized({ ...registered, timestamp: endedTs + 1000 }, {
         status: 200, json: { ok: true },
       });
       expect(db.query("SELECT pane_id FROM sessions WHERE session_id = ?").get(sessionId)).toEqual({ pane_id: paneId });
@@ -396,7 +406,7 @@ describe("POST /event/normalized", () => {
   test("hook-path duplicate events stay idempotent against the persistence layer", async () => {
     const sessionId = `hook-idempotent-${crypto.randomUUID()}`;
     const paneId = `%${sessionId}`;
-    const postHook = async (hookEventName: string, extra: Record<string, unknown> = {}) => {
+    const postHook = async (hookEventName: string, extra: Record<string, unknown> = {}): Promise<EndpointResponse> => {
       const response = await fetch(`${baseUrl}/event`, {
         method: "POST",
         headers: { "content-type": "application/json", "x-tmux-pane": paneId },
@@ -407,6 +417,12 @@ describe("POST /event/normalized", () => {
       });
       return { status: response.status, json: await response.json() as Record<string, unknown> };
     };
+    const expectHook = (
+      hookEventName: string,
+      extra: Record<string, unknown>,
+      expected: EndpointResponse,
+    ): Promise<void> =>
+      expectResponse(postHook(hookEventName, extra), expected, `POST /event ${hookEventName} session=${sessionId}`);
     const db = new Database(join(dataDir, "trailboss.db"));
     const liveQueueRows = () =>
       db.query("SELECT COUNT(*) AS count FROM queue WHERE session_id = ? AND dequeued_at IS NULL").get(sessionId) as { count: number };
@@ -414,21 +430,21 @@ describe("POST /event/normalized", () => {
     try {
       // Duplicate Stop (stuck) hooks: one queue entry, one success response each.
       const stop = { last_assistant_message: "waiting for input" };
-      await expect(postHook("Stop", stop)).resolves.toEqual({ status: 200, json: { ok: true } });
-      await expect(postHook("Stop", stop)).resolves.toEqual({ status: 200, json: { ok: true } });
+      await expectHook("Stop", stop, { status: 200, json: { ok: true } });
+      await expectHook("Stop", stop, { status: 200, json: { ok: true } });
       expect(liveQueueRows().count).toBe(1);
 
       // Resolved via UserPromptSubmit, then a duplicate: both succeed, queue stays empty.
-      await expect(postHook("UserPromptSubmit")).resolves.toEqual({ status: 200, json: { ok: true } });
+      await expectHook("UserPromptSubmit", {}, { status: 200, json: { ok: true } });
       expect(liveQueueRows().count).toBe(0);
-      await expect(postHook("UserPromptSubmit")).resolves.toEqual({ status: 200, json: { ok: true } });
+      await expectHook("UserPromptSubmit", {}, { status: 200, json: { ok: true } });
       expect(liveQueueRows().count).toBe(0);
 
       // Duplicate SessionEnd hooks: the second is a no-op with the same success body.
-      await expect(postHook("SessionStart")).resolves.toEqual({ status: 200, json: { ok: true } });
-      await expect(postHook("SessionEnd")).resolves.toEqual({ status: 200, json: { ok: true } });
+      await expectHook("SessionStart", {}, { status: 200, json: { ok: true } });
+      await expectHook("SessionEnd", {}, { status: 200, json: { ok: true } });
       expect(db.query("SELECT session_id FROM sessions WHERE session_id = ?").get(sessionId)).toBeNull();
-      await expect(postHook("SessionEnd")).resolves.toEqual({ status: 200, json: { ok: true } });
+      await expectHook("SessionEnd", {}, { status: 200, json: { ok: true } });
       expect(db.query("SELECT session_id FROM sessions WHERE session_id = ?").get(sessionId)).toBeNull();
       expect(db.query("SELECT id FROM queue WHERE session_id = ?").all(sessionId)).toEqual([]);
     } finally {
@@ -453,29 +469,29 @@ describe("POST /event/normalized", () => {
       timestamp,
     });
 
-    await expect(postEvent(stuck(paneId))).resolves.toEqual({ status: 200, json: { ok: true } });
-    await expect(postEvent(stuck(sessionId))).resolves.toEqual({ status: 200, json: { ok: true } });
+    await expectNormalized(stuck(paneId), { status: 200, json: { ok: true } });
+    await expectNormalized(stuck(sessionId), { status: 200, json: { ok: true } });
 
     const db = new Database(join(dataDir, "trailboss.db"));
     expect(db.query("SELECT session_id FROM sessions WHERE session_id = ?").get(paneId)).toBeNull();
     expect(db.query("SELECT id FROM queue WHERE session_id = ?").all(paneId)).toEqual([]);
     expect(db.query("SELECT reason FROM queue WHERE session_id = ? AND dequeued_at IS NULL").get(sessionId)).toEqual({ reason: "stopped" });
     db.close();
-    await expect(postEvent({ type: "ended", sessionId, timestamp })).resolves.toEqual({ status: 200, json: { ok: true } });
+    await expectNormalized({ type: "ended", sessionId, timestamp }, { status: 200, json: { ok: true } });
   });
 
   test("unstuck clears a queued synthetic pane and retains the registered session", async () => {
     const paneId = `%bootstrap-${crypto.randomUUID()}`;
     const sessionId = `real-${crypto.randomUUID()}`;
     const timestamp = Date.now();
-    await expect(postEvent({
+    await expectNormalized({
       type: "stuck", sessionId: paneId, paneId, cwd: repoRoot, transcriptPath: "",
       reason: "stopped", message: "waiting for input", timestamp,
-    })).resolves.toEqual({ status: 200, json: { ok: true } });
-    await expect(postEvent({
+    }, { status: 200, json: { ok: true } });
+    await expectNormalized({
       type: "registered", sessionId, paneId, cwd: repoRoot, transcriptPath: "", timestamp,
-    })).resolves.toEqual({ status: 200, json: { ok: true } });
-    await expect(postEvent({ type: "unstuck", sessionId, timestamp })).resolves.toEqual({
+    }, { status: 200, json: { ok: true } });
+    await expectNormalized({ type: "unstuck", sessionId, timestamp }, {
       status: 200, json: { ok: true },
     });
 
@@ -485,6 +501,6 @@ describe("POST /event/normalized", () => {
     expect(db.query("SELECT pane_id FROM sessions WHERE session_id = ?").get(sessionId)).toEqual({ pane_id: paneId });
     expect((await (await fetch(`${baseUrl}/status`)).json()).stuckCount).toBe(0);
     db.close();
-    await expect(postEvent({ type: "ended", sessionId, timestamp })).resolves.toEqual({ status: 200, json: { ok: true } });
+    await expectNormalized({ type: "ended", sessionId, timestamp }, { status: 200, json: { ok: true } });
   });
 });
