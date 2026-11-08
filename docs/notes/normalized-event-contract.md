@@ -38,6 +38,8 @@ Content-Type: application/json
 
 The endpoint returns these same status and error body for the same invalid request. It validates the entire payload before dispatching it; a rejected request does not change session or queue state.
 
+**Retries are safe.** Submitting the same valid event again returns the same success response (`200 {"ok": true}`). A retry that arrives after the session has progressed (unstuck) or ended leaves no new session or queue state; see [retry semantics](normalized-event-schema.md#retry-semantics).
+
 ### Field validation
 
 - `sessionId` and `paneId` must be strings containing at least one non-whitespace character.

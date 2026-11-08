@@ -18,6 +18,15 @@ db.exec("PRAGMA foreign_keys=ON");
 const schema = fs.readFileSync(path.join(import.meta.dir, "schema.sql"), "utf-8");
 db.exec(schema);
 
+// Migration: sessions.last_unstuck_at was added for normalized-event
+// idempotency (trailbos-3b5adcf9). CREATE TABLE IF NOT EXISTS cannot add a
+// column to a database created before the column existed, so ALTER it into
+// place when missing. Fresh databases already get it from schema.sql.
+const sessionColumns = db.prepare("PRAGMA table_info(sessions)").all() as Array<{ name: string }>;
+if (!sessionColumns.some((col) => col.name === "last_unstuck_at")) {
+  db.exec("ALTER TABLE sessions ADD COLUMN last_unstuck_at INTEGER");
+}
+
 // Session registry operations
 export function upsertSession(
   sessionId: string,
@@ -55,6 +64,70 @@ export function deleteSession(sessionId: string): void {
   db.prepare("DELETE FROM sessions WHERE session_id = ?").run(sessionId);
 }
 
+// ============================================================================
+// Idempotency: progress markers and tombstones for retried events
+//
+// At-least-once delivery means the same valid event can arrive more than once,
+// possibly after the session moved on. A stuck/registered event whose producer
+// timestamp is not newer than the session's recorded progress point (last
+// unstuck, or the tombstone of a later ended/replacement) is a stale retry: it
+// is ignored instead of resurrecting queue/state effects. Retries still get
+// the documented 200 {ok:true} — the guard lives in the dispatch paths.
+// ============================================================================
+
+// Record the producer timestamp of an unstuck so later retries of older stuck
+// events can be recognized as stale. Monotonic: an out-of-order older unstuck
+// never rolls the marker back.
+export function markSessionUnstuck(sessionId: string, unstuckAt: number): void {
+  db.prepare(
+    "UPDATE sessions SET last_unstuck_at = MAX(COALESCE(last_unstuck_at, 0), ?) WHERE session_id = ?"
+  ).run(unstuckAt, sessionId);
+}
+
+// Write (or advance) the tombstone for a session id. Written when an ended
+// event deletes the session and when a real event replaces a synthetic pane
+// session, so stale events keyed by the old id cannot resurrect them.
+export function recordEndedSession(sessionId: string, endedAt: number): void {
+  const sess = getSession(sessionId);
+  db.prepare(`
+    INSERT INTO ended_sessions (session_id, pane_id, ended_at, created_at)
+    VALUES (?, ?, ?, ?)
+    ON CONFLICT (session_id) DO UPDATE SET
+      ended_at = MAX(ended_at, excluded.ended_at),
+      created_at = excluded.created_at
+  `).run(sessionId, sess?.pane_id ?? "", endedAt, Date.now());
+}
+
+// Delete a session, remembering when it ended so retried stuck/registered
+// events for it are ignored rather than resurrecting deleted state.
+export function endSession(sessionId: string, endedAt: number): void {
+  recordEndedSession(sessionId, endedAt);
+  deleteSession(sessionId);
+}
+
+// True when an event with this producer timestamp has already been superseded
+// for the session: the session progressed past it (unstuck at or after the
+// event time) or the session ended (or was replaced) at or after it.
+export function isEventSuperseded(sessionId: string, eventTimestamp: number): boolean {
+  const session = db.prepare(
+    "SELECT last_unstuck_at FROM sessions WHERE session_id = ?"
+  ).get(sessionId) as { last_unstuck_at: number | null } | null;
+  if (session?.last_unstuck_at != null && session.last_unstuck_at >= eventTimestamp) {
+    return true;
+  }
+  const tombstone = db.prepare(
+    "SELECT ended_at FROM ended_sessions WHERE session_id = ?"
+  ).get(sessionId) as { ended_at: number } | null;
+  return tombstone != null && tombstone.ended_at >= eventTimestamp;
+}
+
+// Drop tombstones past the retention window (matched the queue's 24h cleanup),
+// so the table stays bounded without suppressing fresh events.
+export function cleanupEndedSessions(olderThanMs: number = 24 * 60 * 60 * 1000): void {
+  const cutoff = Date.now() - olderThanMs;
+  db.prepare("DELETE FROM ended_sessions WHERE created_at < ?").run(cutoff);
+}
+
 // Queue operations
 // Enqueue a session, or update existing entry if already queued (idempotent)
 export function enqueue(sessionId: string, reason: string, stuckAt: number): void {
@@ -86,11 +159,15 @@ export function dequeue(sessionId: string): void {
 }
 
 // Remove any synthetic bootstrap entry whose session_id equals the pane_id
-// (but skip if it's already the real session). Called when a real event fires for a pane.
-export function dequeueByPaneId(paneId: string, realSessionId: string): void {
+// (but skip if it's already the real session). Called when a real event fires
+// for a pane. supersededAt is the firing event's producer timestamp, recorded
+// as the synthetic session's tombstone so a retried bootstrap event for that
+// pane cannot resurrect the synthetic entry.
+export function dequeueByPaneId(paneId: string, realSessionId: string, supersededAt: number): void {
   // Bootstrap entries have session_id = pane_id. Remove their queue history
   // before deleting the session, since queue.session_id is a foreign key.
   if (paneId !== realSessionId) {
+    recordEndedSession(paneId, supersededAt);
     deleteSession(paneId);
   }
 }

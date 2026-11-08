@@ -6,7 +6,7 @@ import { fileURLToPath } from "url";
 import type { HookEvent, NormalizedEvent } from "./types.ts";
 import { adaptHookEvent, isStuckEvent, isUnstuckEvent, isSessionRegistered, isSessionEnded } from "./claude-adapter.ts";
 import { validateNormalizedEvent } from "./normalized-event.ts";
-import { upsertSession, deleteSession, enqueue, dequeue, dequeueByPaneId, skipHead, getHead, getStuckCount, getAllStuck, cleanupQueue, getSession, getStarvationDiagnostic } from "./db.ts";
+import { upsertSession, enqueue, dequeue, dequeueByPaneId, skipHead, getHead, getStuckCount, getAllStuck, cleanupQueue, cleanupEndedSessions, getSession, getStarvationDiagnostic, isEventSuperseded, markSessionUnstuck, endSession } from "./db.ts";
 import { startReconcileLoop, reconcileStuckDirection, startStarvationDetection } from "./reconcile.ts";
 import { startNotificationChecker } from "./notify.ts";
 import { execSync } from "child_process";
@@ -64,37 +64,46 @@ function replaySpool(): { replayed: number; failed: number } {
 
       // Process the event exactly as if it were a fresh POST
       if (isStuckEvent(event)) {
-        if (event.sessionId !== event.paneId) {
-          dequeueByPaneId(event.paneId, event.sessionId);
+        if (isEventSuperseded(event.sessionId, event.timestamp)) {
+          console.log(`[spool] stuck: ${event.sessionId.slice(0, 8)} superseded, ignored`);
+        } else {
+          if (event.sessionId !== event.paneId) {
+            dequeueByPaneId(event.paneId, event.sessionId, event.timestamp);
+          }
+          upsertSession(
+            event.sessionId,
+            event.paneId,
+            event.cwd,
+            event.transcriptPath,
+            event.timestamp,
+            event.reason,
+            event.message
+          );
+          enqueue(event.sessionId, event.reason, event.timestamp);
+          console.log(`[spool] stuck: ${event.sessionId.slice(0, 8)} (${event.reason})`);
         }
-        upsertSession(
-          event.sessionId,
-          event.paneId,
-          event.cwd,
-          event.transcriptPath,
-          event.timestamp,
-          event.reason,
-          event.message
-        );
-        enqueue(event.sessionId, event.reason, event.timestamp);
-        console.log(`[spool] stuck: ${event.sessionId.slice(0, 8)} (${event.reason})`);
       } else if (isUnstuckEvent(event)) {
         dequeue(event.sessionId);
-        dequeueByPaneId(event.paneId, event.sessionId);
+        markSessionUnstuck(event.sessionId, event.timestamp);
+        dequeueByPaneId(event.paneId, event.sessionId, event.timestamp);
         console.log(`[spool] unstuck: ${event.sessionId.slice(0, 8)}`);
       } else if (isSessionRegistered(event)) {
-        upsertSession(
-          event.sessionId,
-          event.paneId,
-          event.cwd,
-          event.transcriptPath,
-          null,
-          null,
-          null
-        );
-        console.log(`[spool] registered: ${event.sessionId.slice(0, 8)} -> ${event.paneId}`);
+        if (isEventSuperseded(event.sessionId, event.timestamp)) {
+          console.log(`[spool] registered: ${event.sessionId.slice(0, 8)} superseded, ignored`);
+        } else {
+          upsertSession(
+            event.sessionId,
+            event.paneId,
+            event.cwd,
+            event.transcriptPath,
+            null,
+            null,
+            null
+          );
+          console.log(`[spool] registered: ${event.sessionId.slice(0, 8)} -> ${event.paneId}`);
+        }
       } else if (isSessionEnded(event)) {
-        deleteSession(event.sessionId);
+        endSession(event.sessionId, event.timestamp);
         console.log(`[spool] ended: ${event.sessionId.slice(0, 8)}`);
       }
 
@@ -154,8 +163,11 @@ startReconcileLoop(5000);
 // Start starvation detection loop (runs every 60s)
 startStarvationDetection(60000);
 
-// Cleanup old queue entries hourly
-setInterval(() => cleanupQueue(), 60 * 60 * 1000);
+// Cleanup old queue entries hourly (and expired ended-session tombstones)
+setInterval(() => {
+  cleanupQueue();
+  cleanupEndedSessions();
+}, 60 * 60 * 1000);
 
 // Start notification checker (sends alerts when queue depth crosses threshold)
 startNotificationChecker();
@@ -191,44 +203,56 @@ const server = http.createServer(async (req, res) => {
       const event = adaptHookEvent(raw, paneId);
 
       if (isStuckEvent(event)) {
-        // Clean up any bootstrap synthetic entry for this pane before registering real session
-        if (event.sessionId !== event.paneId) {
-          dequeueByPaneId(event.paneId, event.sessionId);
+        // Retry safety: a stale retried stuck event must not resurrect
+        // queue/state for a session that progressed or ended.
+        if (isEventSuperseded(event.sessionId, event.timestamp)) {
+          console.log(`[event] stuck: ${event.sessionId.slice(0, 8)} superseded, ignored`);
+        } else {
+          // Clean up any bootstrap synthetic entry for this pane before registering real session
+          if (event.sessionId !== event.paneId) {
+            dequeueByPaneId(event.paneId, event.sessionId, event.timestamp);
+          }
+          upsertSession(
+            event.sessionId,
+            event.paneId,
+            event.cwd,
+            event.transcriptPath,
+            event.timestamp,
+            event.reason,
+            event.message
+          );
+          enqueue(event.sessionId, event.reason, event.timestamp);
+          console.log(`[event] stuck: ${event.sessionId.slice(0, 8)} (${event.reason})`);
         }
-        upsertSession(
-          event.sessionId,
-          event.paneId,
-          event.cwd,
-          event.transcriptPath,
-          event.timestamp,
-          event.reason,
-          event.message
-        );
-        enqueue(event.sessionId, event.reason, event.timestamp);
-        console.log(`[event] stuck: ${event.sessionId.slice(0, 8)} (${event.reason})`);
       } else if (isUnstuckEvent(event)) {
         // Dequeue by session_id; also clean up any bootstrap entry for this pane
         const sess = getSession(event.sessionId);
         dequeue(event.sessionId);
-        dequeueByPaneId(event.paneId, event.sessionId);
+        markSessionUnstuck(event.sessionId, event.timestamp);
+        dequeueByPaneId(event.paneId, event.sessionId, event.timestamp);
         console.log(`[event] unstuck: ${event.sessionId.slice(0, 8)}`);
         // Auto-jump if enabled and this was the operator's current pane
         if (sess) {
           maybeAutoJump(sess.pane_id);
         }
       } else if (isSessionRegistered(event)) {
-        upsertSession(
-          event.sessionId,
-          event.paneId,
-          event.cwd,
-          event.transcriptPath,
-          null,
-          null,
-          null
-        );
-        console.log(`[event] registered: ${event.sessionId.slice(0, 8)} -> ${event.paneId}`);
+        // Retry safety: a retried registration must not resurrect ended state.
+        if (isEventSuperseded(event.sessionId, event.timestamp)) {
+          console.log(`[event] registered: ${event.sessionId.slice(0, 8)} superseded, ignored`);
+        } else {
+          upsertSession(
+            event.sessionId,
+            event.paneId,
+            event.cwd,
+            event.transcriptPath,
+            null,
+            null,
+            null
+          );
+          console.log(`[event] registered: ${event.sessionId.slice(0, 8)} -> ${event.paneId}`);
+        }
       } else if (isSessionEnded(event)) {
-        deleteSession(event.sessionId);
+        endSession(event.sessionId, event.timestamp);
         console.log(`[event] ended: ${event.sessionId.slice(0, 8)}`);
       }
 
@@ -377,9 +401,15 @@ const server = http.createServer(async (req, res) => {
 
 function dispatchNormalizedEvent(event: NormalizedEvent): void {
   if (event.type === "stuck") {
+    // Retry safety: a duplicate stuck event that arrives after the session
+    // progressed (unstuck) or ended must not resurrect queue/state effects.
+    if (isEventSuperseded(event.sessionId, event.timestamp)) {
+      console.log(`[normalized] stuck: ${event.sessionId.slice(0, 8)} superseded, ignored`);
+      return;
+    }
     // Clean up any bootstrap synthetic entry for this pane before registering real session.
     if (event.sessionId !== event.paneId) {
-      dequeueByPaneId(event.paneId, event.sessionId);
+      dequeueByPaneId(event.paneId, event.sessionId, event.timestamp);
     }
     upsertSession(
       event.sessionId,
@@ -398,8 +428,9 @@ function dispatchNormalizedEvent(event: NormalizedEvent): void {
   if (event.type === "unstuck") {
     const sess = getSession(event.sessionId);
     dequeue(event.sessionId);
+    markSessionUnstuck(event.sessionId, event.timestamp);
     if (sess) {
-      dequeueByPaneId(sess.pane_id, event.sessionId);
+      dequeueByPaneId(sess.pane_id, event.sessionId, event.timestamp);
     }
     console.log(`[normalized] unstuck: ${event.sessionId.slice(0, 8)}`);
     // Auto-jump if enabled and this was the operator's current pane.
@@ -410,6 +441,12 @@ function dispatchNormalizedEvent(event: NormalizedEvent): void {
   }
 
   if (event.type === "registered") {
+    // Retry safety: same as stuck — a retried registration for a session that
+    // has since progressed or ended must not resurrect state.
+    if (isEventSuperseded(event.sessionId, event.timestamp)) {
+      console.log(`[normalized] registered: ${event.sessionId.slice(0, 8)} superseded, ignored`);
+      return;
+    }
     upsertSession(
       event.sessionId,
       event.paneId,
@@ -424,7 +461,7 @@ function dispatchNormalizedEvent(event: NormalizedEvent): void {
   }
 
   if (event.type === "ended") {
-    deleteSession(event.sessionId);
+    endSession(event.sessionId, event.timestamp);
     console.log(`[normalized] ended: ${event.sessionId.slice(0, 8)}`);
     return;
   }

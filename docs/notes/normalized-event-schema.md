@@ -255,9 +255,9 @@ interface SessionEnded {
 2. **Pane ID consistency**: `paneId` should be consistent across registered/stuck events for the same session
 3. **Event ordering**: `registered` → `stuck` → `unstuck` → `ended` (unstuck may repeat, ended is terminal)
 4. **Idempotency**: Duplicate events are handled gracefully:
-   - Duplicate `stuck`: Updates the queue entry (new timestamp, message)
+   - Duplicate `stuck`: Updates the queue entry (new timestamp, message) while it is still queued; ignored entirely if the session has since progressed or ended (see [Retry semantics](#retry-semantics))
    - Duplicate `unstuck`: No-op if session not in queue
-   - Duplicate `registered`: Updates pane/cwd/transcript metadata
+   - Duplicate `registered`: Updates pane/cwd/transcript metadata; ignored if the session has since progressed or ended
    - Duplicate `ended`: No-op if session not tracked
 
 ### Type-Specific Rules
@@ -308,6 +308,30 @@ The daemon handles out-of-order events gracefully:
 1. **Unstuck before stuck**: Ignored (session not in queue)
 2. **Ended before registered**: Ignored (session not tracked)
 3. **Stuck after ended**: Ignored (session no longer tracked)
+
+Cases 2 and 3 are enforced with [retry semantics](#retry-semantics): an event
+whose producer timestamp is not newer than the session's recorded end is
+ignored instead of resurrecting deleted state.
+
+### Retry Semantics
+
+Delivery is at-least-once, so the same valid event can arrive more than once,
+possibly after the session moved on. The daemon compares the event's producer
+`timestamp` against the session's recorded progress:
+
+- **Progress marker**: an `unstuck` records its timestamp on the session
+  (`sessions.last_unstuck_at`). A retried `stuck`/`registered` event whose
+  timestamp is not newer than that marker is ignored — it cannot re-enqueue a
+  session that already resolved.
+- **End tombstones**: an `ended` event (and the replacement of a synthetic
+  bootstrap session by a real one) writes a tombstone for the session id
+  (`ended_sessions`, pruned after 24h). Retried events keyed by a
+  tombstoned id whose timestamp is not newer than the tombstone are ignored.
+
+An ignored retry still returns the documented success response
+(`200 {"ok": true}`) — no mutation, no error. A genuinely newer event
+(timestamp strictly greater than the recorded progress) applies normally, so
+legitimate stuck → unstuck → stuck-again cycles keep working.
 
 ### Unknown Event Types
 

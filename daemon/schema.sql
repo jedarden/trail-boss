@@ -10,7 +10,18 @@ CREATE TABLE IF NOT EXISTS sessions (
   last_stuck_at INTEGER,           -- unix timestamp of last Stop/PermissionRequest
   last_stuck_reason TEXT,          -- 'stopped' | 'permission'
   last_message TEXT,               -- last_assistant_message or tool_name+input
+  last_unstuck_at INTEGER,         -- producer timestamp of last unstuck (idempotency marker)
   created_at INTEGER NOT NULL      -- unix timestamp
+);
+
+-- Tombstones for ended (or superseded synthetic) sessions. A retried
+-- stuck/registered event whose producer timestamp is not newer than the
+-- tombstone's ended_at is ignored instead of resurrecting deleted state.
+CREATE TABLE IF NOT EXISTS ended_sessions (
+  session_id TEXT PRIMARY KEY,
+  pane_id TEXT NOT NULL,
+  ended_at INTEGER NOT NULL,       -- producer timestamp of the ended event
+  created_at INTEGER NOT NULL      -- unix timestamp when the tombstone was written
 );
 
 CREATE TABLE IF NOT EXISTS queue (

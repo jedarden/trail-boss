@@ -291,6 +291,153 @@ describe("POST /event/normalized", () => {
     db.close();
   });
 
+  test("stale duplicate stuck after unstuck is ignored without re-enqueueing, a newer stuck still applies", async () => {
+    const sessionId = `stale-stuck-${crypto.randomUUID()}`;
+    const paneId = `%${sessionId}`;
+    const t0 = Date.now();
+    const registered = {
+      type: "registered", sessionId, paneId, cwd: repoRoot, transcriptPath: "", timestamp: t0,
+    };
+    const stuck = (ts: number) => ({
+      type: "stuck", sessionId, paneId, cwd: repoRoot, transcriptPath: "",
+      reason: "stopped", message: "waiting for input", timestamp: ts,
+    });
+    const db = new Database(join(dataDir, "trailboss.db"));
+    const liveQueueRows = () =>
+      db.query("SELECT COUNT(*) AS count FROM queue WHERE session_id = ? AND dequeued_at IS NULL").get(sessionId) as { count: number };
+
+    try {
+      await expect(postEvent(registered)).resolves.toEqual({ status: 200, json: { ok: true } });
+      await expect(postEvent(stuck(t0 + 1000))).resolves.toEqual({ status: 200, json: { ok: true } });
+      expect(liveQueueRows().count).toBe(1);
+
+      // Session progresses past the stuck event...
+      await expect(postEvent({ type: "unstuck", sessionId, timestamp: t0 + 2000 })).resolves.toEqual({
+        status: 200, json: { ok: true },
+      });
+      expect(
+        db.query("SELECT last_unstuck_at FROM sessions WHERE session_id = ?").get(sessionId)
+      ).toEqual({ last_unstuck_at: t0 + 2000 });
+      expect(liveQueueRows().count).toBe(0);
+
+      // ...so the retried stuck event (same producer timestamp) is a no-op that
+      // still returns the documented success response.
+      await expect(postEvent(stuck(t0 + 1000))).resolves.toEqual({ status: 200, json: { ok: true } });
+      expect(liveQueueRows().count).toBe(0);
+      expect(
+        db.query("SELECT last_stuck_at, last_stuck_reason, last_message FROM sessions WHERE session_id = ?").get(sessionId)
+      ).toEqual({ last_stuck_at: t0 + 1000, last_stuck_reason: "stopped", last_message: "waiting for input" });
+
+      // A genuinely newer stuck event is not suppressed.
+      await expect(postEvent(stuck(t0 + 3000))).resolves.toEqual({ status: 200, json: { ok: true } });
+      expect(liveQueueRows().count).toBe(1);
+      expect(
+        db.query("SELECT stuck_at FROM queue WHERE session_id = ? AND dequeued_at IS NULL").get(sessionId)
+      ).toEqual({ stuck_at: t0 + 3000 });
+    } finally {
+      await postEvent({ type: "ended", sessionId, timestamp: t0 + 4000 });
+      db.close();
+    }
+  });
+
+  test("duplicate stuck, registered, and ended events after ended do not resurrect state", async () => {
+    const sessionId = `ended-retry-${crypto.randomUUID()}`;
+    const paneId = `%${sessionId}`;
+    const t0 = Date.now();
+    const registered = {
+      type: "registered", sessionId, paneId, cwd: repoRoot, transcriptPath: "", timestamp: t0,
+    };
+    const stuck = {
+      type: "stuck", sessionId, paneId, cwd: repoRoot, transcriptPath: "",
+      reason: "permission", message: "[Bash] rm -rf /tmp/x", timestamp: t0 + 1000,
+    };
+    const endedTs = t0 + 2000;
+    const db = new Database(join(dataDir, "trailboss.db"));
+
+    try {
+      await expect(postEvent(registered)).resolves.toEqual({ status: 200, json: { ok: true } });
+      await expect(postEvent(stuck)).resolves.toEqual({ status: 200, json: { ok: true } });
+      await expect(postEvent({ type: "ended", sessionId, timestamp: endedTs })).resolves.toEqual({
+        status: 200, json: { ok: true },
+      });
+      expect(db.query("SELECT session_id FROM sessions WHERE session_id = ?").get(sessionId)).toBeNull();
+
+      // Every retried event that predates the end is accepted with the
+      // documented success body but resurrects nothing.
+      const retries = [
+        { label: "stuck", event: stuck },
+        { label: "registered", event: registered },
+        { label: "ended", event: { type: "ended", sessionId, timestamp: endedTs } },
+        { label: "unstuck", event: { type: "unstuck", sessionId, timestamp: t0 + 1500 } },
+      ] as const;
+      for (const { label, event } of retries) {
+        await expect(postEvent(event)).resolves.toEqual({ status: 200, json: { ok: true } });
+        expect(db.query("SELECT session_id FROM sessions WHERE session_id = ?").get(sessionId)).toBeNull();
+        expect(db.query("SELECT id FROM queue WHERE session_id = ?").all(sessionId)).toEqual([]);
+        expect(db.query("SELECT COUNT(*) AS count FROM ended_sessions WHERE session_id = ?").get(sessionId))
+          .toEqual({ count: 1 });
+        console.log(`[test] retried ${label} after ended left no state`);
+      }
+
+      // Boundary: a registration newer than the tombstone is a fresh event,
+      // not a retry, and is accepted.
+      await expect(postEvent({ ...registered, timestamp: endedTs + 1000 })).resolves.toEqual({
+        status: 200, json: { ok: true },
+      });
+      expect(db.query("SELECT pane_id FROM sessions WHERE session_id = ?").get(sessionId)).toEqual({ pane_id: paneId });
+    } finally {
+      db.query("DELETE FROM queue WHERE session_id = ?").run(sessionId);
+      db.query("DELETE FROM sessions WHERE session_id = ?").run(sessionId);
+      db.close();
+      await postEvent({ type: "ended", sessionId, timestamp: endedTs + 2000 });
+    }
+  });
+
+  test("hook-path duplicate events stay idempotent against the persistence layer", async () => {
+    const sessionId = `hook-idempotent-${crypto.randomUUID()}`;
+    const paneId = `%${sessionId}`;
+    const postHook = async (hookEventName: string, extra: Record<string, unknown> = {}) => {
+      const response = await fetch(`${baseUrl}/event`, {
+        method: "POST",
+        headers: { "content-type": "application/json", "x-tmux-pane": paneId },
+        body: JSON.stringify({
+          session_id: sessionId, transcript_path: "", cwd: repoRoot,
+          hook_event_name: hookEventName, ...extra,
+        }),
+      });
+      return { status: response.status, json: await response.json() as Record<string, unknown> };
+    };
+    const db = new Database(join(dataDir, "trailboss.db"));
+    const liveQueueRows = () =>
+      db.query("SELECT COUNT(*) AS count FROM queue WHERE session_id = ? AND dequeued_at IS NULL").get(sessionId) as { count: number };
+
+    try {
+      // Duplicate Stop (stuck) hooks: one queue entry, one success response each.
+      const stop = { last_assistant_message: "waiting for input" };
+      await expect(postHook("Stop", stop)).resolves.toEqual({ status: 200, json: { ok: true } });
+      await expect(postHook("Stop", stop)).resolves.toEqual({ status: 200, json: { ok: true } });
+      expect(liveQueueRows().count).toBe(1);
+
+      // Resolved via UserPromptSubmit, then a duplicate: both succeed, queue stays empty.
+      await expect(postHook("UserPromptSubmit")).resolves.toEqual({ status: 200, json: { ok: true } });
+      expect(liveQueueRows().count).toBe(0);
+      await expect(postHook("UserPromptSubmit")).resolves.toEqual({ status: 200, json: { ok: true } });
+      expect(liveQueueRows().count).toBe(0);
+
+      // Duplicate SessionEnd hooks: the second is a no-op with the same success body.
+      await expect(postHook("SessionStart")).resolves.toEqual({ status: 200, json: { ok: true } });
+      await expect(postHook("SessionEnd")).resolves.toEqual({ status: 200, json: { ok: true } });
+      expect(db.query("SELECT session_id FROM sessions WHERE session_id = ?").get(sessionId)).toBeNull();
+      await expect(postHook("SessionEnd")).resolves.toEqual({ status: 200, json: { ok: true } });
+      expect(db.query("SELECT session_id FROM sessions WHERE session_id = ?").get(sessionId)).toBeNull();
+      expect(db.query("SELECT id FROM queue WHERE session_id = ?").all(sessionId)).toEqual([]);
+    } finally {
+      db.query("DELETE FROM queue WHERE session_id = ?").run(sessionId);
+      db.query("DELETE FROM sessions WHERE session_id = ?").run(sessionId);
+      db.close();
+    }
+  });
+
   test("stuck replaces a queued synthetic pane without a foreign-key error", async () => {
     const paneId = `%bootstrap-${crypto.randomUUID()}`;
     const sessionId = `real-${crypto.randomUUID()}`;
